@@ -1,0 +1,419 @@
+export type Platform = "douyin" | "kuaishou";
+export type VerificationStatus = "unverified" | "source_verified" | "human_confirmed";
+export type EligibilityStatus = "unverified" | "manually_confirmed";
+export type ReviewStatus = "pending" | "approved" | "rejected";
+export type RunStatus = "queued" | "running" | "waiting_review" | "succeeded" | "failed" | "cancelled";
+export type RunStage = "prepare" | "script" | "fact_check" | "review" | "storyboard" | "render" | "complete";
+
+export interface BookFact {
+  key: string;
+  value: string;
+  verification_status: VerificationStatus;
+  source_note: string | null;
+  evidence_id: string | null;
+}
+
+export interface BookCreate {
+  isbn: string | null;
+  title: string;
+  edition_label: string;
+  author: string;
+  publisher: string | null;
+  original_opinion: string;
+  facts: BookFact[];
+}
+
+export interface BookEdition extends BookCreate {
+  id: string;
+  owner_user_id: string;
+  created_at: string;
+}
+
+export interface PromotionCandidateCreate {
+  book_id: string;
+  platform: Platform;
+  platform_product_id: string;
+  product_url: string;
+  eligibility_status: EligibilityStatus;
+  eligibility_checked_at: string | null;
+  eligibility_note: string | null;
+}
+
+export interface PromotionCandidate extends PromotionCandidateCreate {
+  id: string;
+  owner_user_id: string;
+  created_at: string;
+}
+
+export interface EvidenceCreate {
+  source_type: "manual" | "licensed";
+  source_note: string;
+  source_url: string | null;
+  observed_at: string;
+  usage_basis: string;
+  metric_name: string | null;
+  metric_value: number | null;
+  metric_window_start: string | null;
+  metric_window_end: string | null;
+  missing_reason: string | null;
+}
+
+export interface Evidence extends EvidenceCreate {
+  id: string;
+  owner_user_id: string;
+  collected_at: string;
+}
+
+export interface CreativeProjectCreate {
+  book_id: string;
+  promotion_candidate_id: string;
+  target_audience: string;
+  target_platform: Platform;
+  desired_seconds: number;
+  original_angle: string;
+  prohibited_claims: string[];
+  evidence_ids: string[];
+}
+
+export interface CreativeProject extends CreativeProjectCreate {
+  id: string;
+  owner_user_id: string;
+  created_at: string;
+}
+
+export interface ScriptSegment {
+  order: number;
+  onscreen_text: string;
+  narration: string;
+  fact_keys: string[];
+  duration_seconds: number;
+}
+
+export interface ScriptVersionCreate {
+  based_on_version_id: string | null;
+  segments: ScriptSegment[];
+  title_suggestion: string;
+  description_suggestion: string;
+}
+
+export interface ScriptVersion extends ScriptVersionCreate {
+  id: string;
+  project_id: string;
+  owner_user_id: string;
+  version_number: number;
+  review_status: ReviewStatus;
+  created_at: string;
+}
+
+export interface RunCreate {
+  brief_version: number;
+}
+
+export interface Run {
+  id: string;
+  project_id: string;
+  owner_user_id: string;
+  status: RunStatus;
+  stage: RunStage;
+  sequence: number;
+  error_code: string | null;
+  error_message: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface RunEvent {
+  event_id: string;
+  run_id: string;
+  project_id: string;
+  sequence: number;
+  type: "run.created" | "run.stage_changed" | "run.review_requested" | "run.reviewed" | "run.failed" | "run.completed" | "run.cancelled";
+  status: RunStatus;
+  stage: RunStage;
+  occurred_at: string;
+  script_version_id: string | null;
+  render_id: string | null;
+  reason_code: string | null;
+  message: string | null;
+}
+
+export interface ReviewRequest {
+  script_version_id: string;
+  decision: "approve" | "reject";
+  note: string | null;
+  fact_confirmed: boolean;
+  product_match_confirmed: boolean;
+  asset_rights_confirmed: boolean;
+}
+
+export interface AssetRights {
+  origin: "self_created_text" | "self_created_graphic" | "self_recorded_voice" | "licensed";
+  usage_status: "allowed" | "blocked";
+  license_basis: string | null;
+  permitted_uses: string[];
+  proof_ref: string | null;
+  expires_at: string | null;
+}
+
+export interface RenderCreate {
+  project_id: string;
+  script_version_id: string;
+  promotion_candidate_id: string;
+  width: 1080;
+  height: 1920;
+  asset_rights: AssetRights[];
+}
+
+export interface RenderJob {
+  id: string;
+  project_id: string;
+  script_version_id: string;
+  owner_user_id: string;
+  status: RunStatus;
+  output_ref: string | null;
+  error_message: string | null;
+  created_at: string;
+}
+
+export interface PublicationPackage {
+  id: string;
+  project_id: string;
+  book_id: string;
+  script_version_id: string;
+  promotion_candidate_id: string;
+  render_id: string;
+  title: string;
+  description: string;
+  cover_text?: string;
+  video_download_url: string;
+  publication_state: "needs_manual_checks" | "ready_for_manual_publish";
+  checklist: {
+    account_eligible: boolean;
+    product_eligible: boolean;
+    edition_matches: boolean;
+    rights_confirmed: boolean;
+    manual_attachment_required: true;
+  };
+}
+
+export interface ApiErrorBody {
+  code?: string;
+  message?: string;
+  request_id?: string;
+  details?: Record<string, unknown>;
+}
+
+export class ApiRequestError extends Error {
+  readonly status: number;
+  readonly code: string | null;
+  readonly requestId: string | null;
+
+  constructor(message: string, status: number, code: string | null, requestId: string | null) {
+    super(message);
+    this.name = "ApiRequestError";
+    this.status = status;
+    this.code = code;
+    this.requestId = requestId;
+  }
+}
+
+function idempotencyKey(): string {
+  return globalThis.crypto?.randomUUID?.() ?? `web-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+export class BookVideoApi {
+  readonly baseUrl: string;
+
+  constructor(baseUrl: string) {
+    this.baseUrl = baseUrl.replace(/\/+$/, "");
+  }
+
+  private async request<T>(path: string, init: RequestInit = {}): Promise<T> {
+    let response: Response;
+    try {
+      response = await fetch(`${this.baseUrl}${path}`, {
+        ...init,
+        headers: {
+          Accept: "application/json",
+          ...(init.body ? { "Content-Type": "application/json" } : {}),
+          ...init.headers,
+        },
+      });
+    } catch {
+      throw new ApiRequestError(
+        `无法连接到 ${this.baseUrl}。请确认 API 已启动，并检查 VITE_API_BASE_URL。`,
+        0,
+        null,
+        null,
+      );
+    }
+
+    const payload = (await response.json().catch(() => null)) as ApiErrorBody | T | null;
+    if (!response.ok) {
+      const error = payload as ApiErrorBody | null;
+      const message = error?.message ?? `API 请求失败（HTTP ${response.status}）`;
+      throw new ApiRequestError(message, response.status, error?.code ?? null, error?.request_id ?? null);
+    }
+    return payload as T;
+  }
+
+  private async requestBlob(path: string): Promise<Blob> {
+    let response: Response;
+    try {
+      response = await fetch(`${this.baseUrl}${path}`, { headers: { Accept: "video/mp4" } });
+    } catch {
+      throw new ApiRequestError(
+        `无法连接到 ${this.baseUrl}。请确认 API 已启动，并检查 VITE_API_BASE_URL。`,
+        0,
+        null,
+        null,
+      );
+    }
+    if (!response.ok) {
+      const error = (await response.json().catch(() => null)) as ApiErrorBody | null;
+      throw new ApiRequestError(
+        error?.message ?? `视频下载失败（HTTP ${response.status}）`,
+        response.status,
+        error?.code ?? null,
+        error?.request_id ?? null,
+      );
+    }
+    return response.blob();
+  }
+
+  createBook(input: BookCreate): Promise<BookEdition> {
+    return this.request("/books", { method: "POST", body: JSON.stringify(input) });
+  }
+
+  createPromotionCandidate(input: PromotionCandidateCreate): Promise<PromotionCandidate> {
+    return this.request("/promotion-candidates", { method: "POST", body: JSON.stringify(input) });
+  }
+
+  createEvidence(input: EvidenceCreate): Promise<Evidence> {
+    return this.request("/evidence", { method: "POST", body: JSON.stringify(input) });
+  }
+
+  createProject(input: CreativeProjectCreate): Promise<CreativeProject> {
+    return this.request("/creative-projects", { method: "POST", body: JSON.stringify(input) });
+  }
+
+  listScripts(projectId: string): Promise<ScriptVersion[]> {
+    return this.request(`/creative-projects/${encodeURIComponent(projectId)}/scripts`);
+  }
+
+  saveScript(projectId: string, input: ScriptVersionCreate): Promise<ScriptVersion> {
+    return this.request(`/creative-projects/${encodeURIComponent(projectId)}/scripts`, {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
+  }
+
+  startRun(projectId: string, input: RunCreate): Promise<Run> {
+    return this.request(`/creative-projects/${encodeURIComponent(projectId)}/runs`, {
+      method: "POST",
+      headers: { "Idempotency-Key": idempotencyKey() },
+      body: JSON.stringify(input),
+    });
+  }
+
+  getRun(runId: string): Promise<Run> {
+    return this.request(`/runs/${encodeURIComponent(runId)}`);
+  }
+
+  subscribeToRunEvents(
+    runId: string,
+    onEvent: (event: RunEvent) => void,
+    onError: () => void,
+  ): { close: () => void } {
+    let closed = false;
+    let lastSequence = 0;
+    let controller: AbortController | null = null;
+    let reconnectTimer: number | null = null;
+
+    const connect = async () => {
+      if (closed) return;
+      controller = new AbortController();
+      try {
+        const headers = new Headers({ Accept: "text/event-stream" });
+        if (lastSequence > 0) headers.set("Last-Event-ID", String(lastSequence));
+        const response = await fetch(`${this.baseUrl}/runs/${encodeURIComponent(runId)}/events`, {
+          headers,
+          signal: controller.signal,
+        });
+        if (!response.ok || !response.body) throw new Error("SSE 连接不可用");
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        while (!closed) {
+          const chunk = await reader.read();
+          if (chunk.done) break;
+          buffer += decoder.decode(chunk.value, { stream: true }).replace(/\r\n/g, "\n");
+          let boundary = buffer.indexOf("\n\n");
+          while (boundary >= 0) {
+            const frame = buffer.slice(0, boundary);
+            buffer = buffer.slice(boundary + 2);
+            const data = frame.split("\n")
+              .filter((line) => line.startsWith("data:"))
+              .map((line) => line.slice(5).trimStart())
+              .join("\n");
+            if (data) {
+              try {
+                const event = JSON.parse(data) as RunEvent;
+                if (event.sequence > lastSequence) {
+                  lastSequence = event.sequence;
+                  onEvent(event);
+                }
+              } catch {
+                onError();
+              }
+            }
+            boundary = buffer.indexOf("\n\n");
+          }
+        }
+      } catch {
+        if (!closed) onError();
+      } finally {
+        if (!closed) reconnectTimer = window.setTimeout(() => void connect(), 1500);
+      }
+    };
+
+    void connect();
+    return {
+      close: () => {
+        closed = true;
+        controller?.abort();
+        if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+      },
+    };
+  }
+
+  reviewRun(runId: string, input: ReviewRequest): Promise<Run> {
+    return this.request(`/runs/${encodeURIComponent(runId)}/review`, {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
+  }
+
+  startRender(input: RenderCreate): Promise<RenderJob> {
+    return this.request("/renders", {
+      method: "POST",
+      headers: { "Idempotency-Key": idempotencyKey() },
+      body: JSON.stringify(input),
+    });
+  }
+
+  getRender(renderId: string): Promise<RenderJob> {
+    return this.request(`/renders/${encodeURIComponent(renderId)}`);
+  }
+
+  downloadRender(renderId: string): Promise<Blob> {
+    return this.requestBlob(`/renders/${encodeURIComponent(renderId)}/download`);
+  }
+
+  getPublicationPackage(projectId: string): Promise<PublicationPackage> {
+    return this.request(`/creative-projects/${encodeURIComponent(projectId)}/publication-package`);
+  }
+}
+
+export const DEFAULT_API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000/api/v1";

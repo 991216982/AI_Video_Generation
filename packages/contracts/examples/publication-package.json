@@ -1,0 +1,20 @@
+{
+  "id": "00000000-0000-4000-8000-000000000010",
+  "project_id": "00000000-0000-4000-8000-000000000003",
+  "book_id": "00000000-0000-4000-8000-000000000011",
+  "script_version_id": "00000000-0000-4000-8000-000000000012",
+  "promotion_candidate_id": "00000000-0000-4000-8000-000000000004",
+  "render_id": "00000000-0000-4000-8000-000000000013",
+  "title": "虚构样例发布标题",
+  "description": "仅用于本地测试，不代表商品可推广。",
+  "cover_text": "原创文字画面",
+  "video_download_url": "https://example.invalid/api/v1/renders/00000000-0000-4000-8000-000000000013/download",
+  "publication_state": "needs_manual_checks",
+  "checklist": {
+    "account_eligible": false,
+    "product_eligible": false,
+    "edition_matches": true,
+    "rights_confirmed": true,
+    "manual_attachment_required": true
+  }
+}

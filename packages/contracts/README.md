@@ -12,6 +12,7 @@
 - `RunStatus` 只能按下表迁移；每次变化产生一个单调递增 `sequence` 的 `RunEvent`。SSE 可按 `Last-Event-ID` 从上次 `sequence` 继续；重复事件以 `(run_id, sequence)` 去重。
 - `ScriptVersion` 审核通过后不可原地修改。修改要创建下一版本。渲染请求必须携带已通过审核的 `script_version_id`、同版本 `promotion_candidate_id` 及 `idempotency_key`。
 - `PublicationPackage` 的 `publication_state` 只表示本地准备情况；不表示视频已发布或商品已挂车。导出包始终包含人工检查项。
+- `video_download_url` 指向服务端按当前所有者校验的 `GET /renders/{render_id}/download`；仅返回本服务已完成的 MP4，不允许客户端指定文件路径。
 
 | 当前状态 | 可迁移至 |
 | --- | --- |

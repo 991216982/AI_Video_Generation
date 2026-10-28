@@ -60,6 +60,8 @@ def main() -> None:
     event = json.loads((CONTRACTS / "examples" / "run-event.json").read_text(encoding="utf-8"))
     Draft202012Validator(event_schema).validate(event)
     assert event["sequence"] == 1
+    package = json.loads((CONTRACTS / "examples" / "publication-package.json").read_text(encoding="utf-8"))
+    Draft202012Validator(schemas["PublicationPackage"], resolver=resolver).validate(package)
     print("stage 0 contracts and examples: OK")
 
 
