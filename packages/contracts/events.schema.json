@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/book-video/run-event.schema.json",
+  "title": "RunEvent",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["event_id", "run_id", "project_id", "sequence", "type", "status", "stage", "occurred_at"],
+  "properties": {
+    "event_id": {"type": "string", "format": "uuid"},
+    "run_id": {"type": "string", "format": "uuid"},
+    "project_id": {"type": "string", "format": "uuid"},
+    "sequence": {"type": "integer", "minimum": 1},
+    "type": {"enum": ["run.created", "run.stage_changed", "run.review_requested", "run.reviewed", "run.failed", "run.completed", "run.cancelled"]},
+    "status": {"enum": ["queued", "running", "waiting_review", "succeeded", "failed", "cancelled"]},
+    "stage": {"enum": ["prepare", "script", "fact_check", "review", "storyboard", "render", "complete"]},
+    "occurred_at": {"type": "string", "format": "date-time"},
+    "script_version_id": {"type": ["string", "null"], "format": "uuid"},
+    "render_id": {"type": ["string", "null"], "format": "uuid"},
+    "reason_code": {"type": ["string", "null"]},
+    "message": {"type": ["string", "null"]}
+  }
+}

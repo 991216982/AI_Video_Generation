@@ -1,0 +1,14 @@
+{
+  "event_id": "00000000-0000-4000-8000-000000000001",
+  "run_id": "00000000-0000-4000-8000-000000000002",
+  "project_id": "00000000-0000-4000-8000-000000000003",
+  "sequence": 1,
+  "type": "run.created",
+  "status": "queued",
+  "stage": "prepare",
+  "occurred_at": "2026-10-28T00:00:00Z",
+  "script_version_id": null,
+  "render_id": null,
+  "reason_code": null,
+  "message": "演示事件，无实际任务"
+}

@@ -1,0 +1,48 @@
+{
+  "sample_only": true,
+  "book": {
+    "title": "把日子写成地图",
+    "edition_label": "虚构演示版 1.0",
+    "author": "林例",
+    "isbn": null,
+    "publisher": null,
+    "original_opinion": "我喜欢用地图比喻日常选择；这本虚构样书仅用于演示原创观点如何进入脚本。",
+    "facts": [
+      {
+        "key": "title",
+        "value": "把日子写成地图",
+        "verification_status": "human_confirmed",
+        "source_note": "虚构演示数据，非真实图书",
+        "evidence_id": null
+      }
+    ]
+  },
+  "promotion_candidate": {
+    "platform": "douyin",
+    "platform_product_id": "DEMO-NOT-REAL",
+    "product_url": "https://example.invalid/demo-product",
+    "eligibility_status": "unverified",
+    "eligibility_checked_at": null,
+    "eligibility_note": "演示占位，不可发布或挂车"
+  },
+  "evidence": {
+    "source_type": "manual",
+    "source_note": "创作者手工输入的虚构示例",
+    "source_url": null,
+    "observed_at": "2026-10-28T00:00:00Z",
+    "usage_basis": "仅限本地开发测试",
+    "metric_name": null,
+    "metric_value": null,
+    "metric_window_start": null,
+    "metric_window_end": null,
+    "missing_reason": "未接入获授权的数据源"
+  },
+  "project_brief": {
+    "target_audience": "喜欢个人规划的成年读者",
+    "target_platform": "douyin",
+    "desired_seconds": 30,
+    "original_angle": "用自制地图图形表达一次小选择，邀请观众分享自己的方法。",
+    "prohibited_claims": ["真实销量", "疗效", "保证改变人生"],
+    "evidence_ids": []
+  }
+}

@@ -1,0 +1,468 @@
+openapi: 3.1.0
+info:
+  title: Book Video Workspace API
+  version: 0.1.0
+  description: Stage 1 frozen draft. Local single-user implementation may use a development identity; every private record is owner-scoped.
+servers:
+  - url: http://127.0.0.1:8000/api/v1
+paths:
+  /books:
+    post:
+      operationId: createBook
+      summary: Create one book edition with manually supplied facts
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BookCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BookEdition' }
+        '422': { $ref: '#/components/responses/Error' }
+  /books/{book_id}:
+    get:
+      operationId: getBook
+      parameters:
+        - { $ref: '#/components/parameters/BookId' }
+      responses:
+        '200':
+          description: Book edition
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BookEdition' }
+        '404': { $ref: '#/components/responses/Error' }
+  /promotion-candidates:
+    post:
+      operationId: createPromotionCandidate
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PromotionCandidateCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PromotionCandidate' }
+        '422': { $ref: '#/components/responses/Error' }
+  /promotion-candidates/{candidate_id}:
+    get:
+      operationId: getPromotionCandidate
+      parameters:
+        - { $ref: '#/components/parameters/CandidateId' }
+      responses:
+        '200':
+          description: Candidate
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PromotionCandidate' }
+        '404': { $ref: '#/components/responses/Error' }
+  /evidence:
+    post:
+      operationId: createEvidence
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EvidenceCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Evidence' }
+        '422': { $ref: '#/components/responses/Error' }
+  /creative-projects:
+    post:
+      operationId: createCreativeProject
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreativeProjectCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CreativeProject' }
+        '422': { $ref: '#/components/responses/Error' }
+  /creative-projects/{project_id}:
+    get:
+      operationId: getCreativeProject
+      parameters:
+        - { $ref: '#/components/parameters/ProjectId' }
+      responses:
+        '200':
+          description: Creative project
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CreativeProject' }
+        '404': { $ref: '#/components/responses/Error' }
+  /creative-projects/{project_id}/scripts:
+    get:
+      operationId: listScriptVersions
+      parameters:
+        - { $ref: '#/components/parameters/ProjectId' }
+      responses:
+        '200':
+          description: Versions
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ScriptVersion' }
+    post:
+      operationId: saveScriptVersion
+      summary: Save edited script as a new version
+      parameters:
+        - { $ref: '#/components/parameters/ProjectId' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ScriptVersionCreate' }
+      responses:
+        '201':
+          description: New version
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ScriptVersion' }
+        '409': { $ref: '#/components/responses/Error' }
+  /creative-projects/{project_id}/runs:
+    post:
+      operationId: startRun
+      parameters:
+        - { $ref: '#/components/parameters/ProjectId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RunCreate' }
+      responses:
+        '202':
+          description: Queued
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Run' }
+        '409': { $ref: '#/components/responses/Error' }
+  /runs/{run_id}:
+    get:
+      operationId: getRun
+      parameters:
+        - { $ref: '#/components/parameters/RunId' }
+      responses:
+        '200':
+          description: Current run state
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Run' }
+        '404': { $ref: '#/components/responses/Error' }
+  /runs/{run_id}/events:
+    get:
+      operationId: streamRunEvents
+      parameters:
+        - { $ref: '#/components/parameters/RunId' }
+        - { name: Last-Event-ID, in: header, required: false, schema: { type: string }, description: Last received sequence }
+      responses:
+        '200':
+          description: SSE events; data payload is RunEvent from events.schema.json
+          content:
+            text/event-stream:
+              schema: { type: string }
+  /runs/{run_id}/review:
+    post:
+      operationId: reviewRun
+      parameters:
+        - { $ref: '#/components/parameters/RunId' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReviewRequest' }
+      responses:
+        '200':
+          description: Review stored
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Run' }
+        '409': { $ref: '#/components/responses/Error' }
+  /renders:
+    post:
+      operationId: startRender
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RenderCreate' }
+      responses:
+        '202':
+          description: Queued
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RenderJob' }
+        '409': { $ref: '#/components/responses/Error' }
+  /renders/{render_id}:
+    get:
+      operationId: getRender
+      parameters:
+        - { $ref: '#/components/parameters/RenderId' }
+      responses:
+        '200':
+          description: Render state
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RenderJob' }
+        '404': { $ref: '#/components/responses/Error' }
+  /creative-projects/{project_id}/publication-package:
+    get:
+      operationId: getPublicationPackage
+      parameters:
+        - { $ref: '#/components/parameters/ProjectId' }
+      responses:
+        '200':
+          description: Download metadata and manual publication checklist
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PublicationPackage' }
+        '404': { $ref: '#/components/responses/Error' }
+components:
+  parameters:
+    BookId: { name: book_id, in: path, required: true, schema: { $ref: '#/components/schemas/Id' } }
+    CandidateId: { name: candidate_id, in: path, required: true, schema: { $ref: '#/components/schemas/Id' } }
+    ProjectId: { name: project_id, in: path, required: true, schema: { $ref: '#/components/schemas/Id' } }
+    RunId: { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/Id' } }
+    RenderId: { name: render_id, in: path, required: true, schema: { $ref: '#/components/schemas/Id' } }
+    IdempotencyKey: { name: Idempotency-Key, in: header, required: true, schema: { type: string, minLength: 8, maxLength: 128 } }
+  responses:
+    Error:
+      description: Error
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+  schemas:
+    Id: { type: string, format: uuid }
+    Timestamp: { type: string, format: date-time }
+    Platform: { type: string, enum: [douyin, kuaishou] }
+    RunStatus: { type: string, enum: [queued, running, waiting_review, succeeded, failed, cancelled] }
+    ApiError:
+      type: object
+      required: [code, message, request_id]
+      properties:
+        code: { type: string }
+        message: { type: string }
+        request_id: { type: string }
+        details: { type: object, additionalProperties: true }
+    BookFact:
+      type: object
+      required: [key, value, verification_status]
+      properties:
+        key: { type: string }
+        value: { type: string }
+        verification_status: { type: string, enum: [unverified, source_verified, human_confirmed] }
+        source_note: { type: [string, 'null'] }
+        evidence_id: { anyOf: [{ $ref: '#/components/schemas/Id' }, { type: 'null' }] }
+    BookCreate:
+      type: object
+      required: [title, edition_label, author, original_opinion, facts]
+      properties:
+        isbn: { type: [string, 'null'] }
+        title: { type: string, minLength: 1 }
+        edition_label: { type: string, minLength: 1 }
+        author: { type: string, minLength: 1 }
+        publisher: { type: [string, 'null'] }
+        original_opinion: { type: string, minLength: 1 }
+        facts: { type: array, items: { $ref: '#/components/schemas/BookFact' } }
+    BookEdition:
+      allOf:
+        - { $ref: '#/components/schemas/BookCreate' }
+        - type: object
+          required: [id, owner_user_id, created_at]
+          properties:
+            id: { $ref: '#/components/schemas/Id' }
+            owner_user_id: { $ref: '#/components/schemas/Id' }
+            created_at: { $ref: '#/components/schemas/Timestamp' }
+    PromotionCandidateCreate:
+      type: object
+      required: [book_id, platform, platform_product_id, product_url]
+      properties:
+        book_id: { $ref: '#/components/schemas/Id' }
+        platform: { $ref: '#/components/schemas/Platform' }
+        platform_product_id: { type: string, minLength: 1 }
+        product_url: { type: string, format: uri }
+        eligibility_status: { type: string, enum: [unverified, manually_confirmed], default: unverified }
+        eligibility_checked_at: { anyOf: [{ $ref: '#/components/schemas/Timestamp' }, { type: 'null' }] }
+        eligibility_note: { type: [string, 'null'] }
+    PromotionCandidate:
+      allOf:
+        - { $ref: '#/components/schemas/PromotionCandidateCreate' }
+        - type: object
+          required: [id, owner_user_id, created_at]
+          properties:
+            id: { $ref: '#/components/schemas/Id' }
+            owner_user_id: { $ref: '#/components/schemas/Id' }
+            created_at: { $ref: '#/components/schemas/Timestamp' }
+    EvidenceCreate:
+      type: object
+      required: [source_type, source_note, observed_at, usage_basis]
+      properties:
+        source_type: { type: string, enum: [manual, licensed] }
+        source_note: { type: string, minLength: 1 }
+        source_url: { type: [string, 'null'], format: uri }
+        observed_at: { $ref: '#/components/schemas/Timestamp' }
+        usage_basis: { type: string, minLength: 1 }
+        metric_name: { type: [string, 'null'] }
+        metric_value: { type: [number, 'null'] }
+        metric_window_start: { anyOf: [{ $ref: '#/components/schemas/Timestamp' }, { type: 'null' }] }
+        metric_window_end: { anyOf: [{ $ref: '#/components/schemas/Timestamp' }, { type: 'null' }] }
+        missing_reason: { type: [string, 'null'] }
+    Evidence:
+      allOf:
+        - { $ref: '#/components/schemas/EvidenceCreate' }
+        - type: object
+          required: [id, owner_user_id, collected_at]
+          properties:
+            id: { $ref: '#/components/schemas/Id' }
+            owner_user_id: { $ref: '#/components/schemas/Id' }
+            collected_at: { $ref: '#/components/schemas/Timestamp' }
+    CreativeProjectCreate:
+      type: object
+      required: [book_id, promotion_candidate_id, target_audience, target_platform, desired_seconds, original_angle]
+      properties:
+        book_id: { $ref: '#/components/schemas/Id' }
+        promotion_candidate_id: { $ref: '#/components/schemas/Id' }
+        target_audience: { type: string, minLength: 1 }
+        target_platform: { $ref: '#/components/schemas/Platform' }
+        desired_seconds: { type: integer, minimum: 20, maximum: 45 }
+        original_angle: { type: string, minLength: 1 }
+        prohibited_claims: { type: array, items: { type: string }, default: [] }
+        evidence_ids: { type: array, items: { $ref: '#/components/schemas/Id' }, default: [] }
+    CreativeProject:
+      allOf:
+        - { $ref: '#/components/schemas/CreativeProjectCreate' }
+        - type: object
+          required: [id, owner_user_id, created_at]
+          properties:
+            id: { $ref: '#/components/schemas/Id' }
+            owner_user_id: { $ref: '#/components/schemas/Id' }
+            created_at: { $ref: '#/components/schemas/Timestamp' }
+    ScriptSegment:
+      type: object
+      required: [order, onscreen_text, narration, fact_keys, duration_seconds]
+      properties:
+        order: { type: integer, minimum: 0 }
+        onscreen_text: { type: string }
+        narration: { type: string }
+        fact_keys: { type: array, items: { type: string } }
+        duration_seconds: { type: number, exclusiveMinimum: 0 }
+    ScriptVersionCreate:
+      type: object
+      required: [segments, title_suggestion, description_suggestion]
+      properties:
+        based_on_version_id: { anyOf: [{ $ref: '#/components/schemas/Id' }, { type: 'null' }] }
+        segments: { type: array, minItems: 1, items: { $ref: '#/components/schemas/ScriptSegment' } }
+        title_suggestion: { type: string }
+        description_suggestion: { type: string }
+    ScriptVersion:
+      allOf:
+        - { $ref: '#/components/schemas/ScriptVersionCreate' }
+        - type: object
+          required: [id, project_id, owner_user_id, version_number, review_status, created_at]
+          properties:
+            id: { $ref: '#/components/schemas/Id' }
+            project_id: { $ref: '#/components/schemas/Id' }
+            owner_user_id: { $ref: '#/components/schemas/Id' }
+            version_number: { type: integer, minimum: 1 }
+            review_status: { type: string, enum: [pending, approved, rejected] }
+            created_at: { $ref: '#/components/schemas/Timestamp' }
+    RunCreate:
+      type: object
+      required: [brief_version]
+      properties:
+        brief_version: { type: integer, minimum: 1 }
+    Run:
+      type: object
+      required: [id, project_id, owner_user_id, status, stage, sequence, created_at, updated_at]
+      properties:
+        id: { $ref: '#/components/schemas/Id' }
+        project_id: { $ref: '#/components/schemas/Id' }
+        owner_user_id: { $ref: '#/components/schemas/Id' }
+        status: { $ref: '#/components/schemas/RunStatus' }
+        stage: { type: string, enum: [prepare, script, fact_check, review, storyboard, render, complete] }
+        sequence: { type: integer, minimum: 0 }
+        error_code: { type: [string, 'null'] }
+        error_message: { type: [string, 'null'] }
+        created_at: { $ref: '#/components/schemas/Timestamp' }
+        updated_at: { $ref: '#/components/schemas/Timestamp' }
+    ReviewRequest:
+      type: object
+      required: [script_version_id, decision, fact_confirmed, product_match_confirmed, asset_rights_confirmed]
+      properties:
+        script_version_id: { $ref: '#/components/schemas/Id' }
+        decision: { type: string, enum: [approve, reject] }
+        note: { type: [string, 'null'] }
+        fact_confirmed: { type: boolean }
+        product_match_confirmed: { type: boolean }
+        asset_rights_confirmed: { type: boolean }
+    AssetRights:
+      type: object
+      required: [origin, usage_status]
+      properties:
+        origin: { type: string, enum: [self_created_text, self_created_graphic, self_recorded_voice, licensed] }
+        usage_status: { type: string, enum: [allowed, blocked] }
+        license_basis: { type: [string, 'null'] }
+        permitted_uses: { type: array, items: { type: string }, default: [] }
+        proof_ref: { type: [string, 'null'] }
+        expires_at: { anyOf: [{ $ref: '#/components/schemas/Timestamp' }, { type: 'null' }] }
+    RenderCreate:
+      type: object
+      required: [project_id, script_version_id, promotion_candidate_id, width, height, asset_rights]
+      properties:
+        project_id: { $ref: '#/components/schemas/Id' }
+        script_version_id: { $ref: '#/components/schemas/Id' }
+        promotion_candidate_id: { $ref: '#/components/schemas/Id' }
+        width: { type: integer, const: 1080 }
+        height: { type: integer, const: 1920 }
+        asset_rights: { type: array, items: { $ref: '#/components/schemas/AssetRights' } }
+    RenderJob:
+      type: object
+      required: [id, project_id, script_version_id, owner_user_id, status, created_at]
+      properties:
+        id: { $ref: '#/components/schemas/Id' }
+        project_id: { $ref: '#/components/schemas/Id' }
+        script_version_id: { $ref: '#/components/schemas/Id' }
+        owner_user_id: { $ref: '#/components/schemas/Id' }
+        status: { $ref: '#/components/schemas/RunStatus' }
+        output_ref: { type: [string, 'null'] }
+        error_message: { type: [string, 'null'] }
+        created_at: { $ref: '#/components/schemas/Timestamp' }
+    PublicationPackage:
+      type: object
+      required: [id, project_id, book_id, script_version_id, promotion_candidate_id, title, description, publication_state, checklist]
+      properties:
+        id: { $ref: '#/components/schemas/Id' }
+        project_id: { $ref: '#/components/schemas/Id' }
+        book_id: { $ref: '#/components/schemas/Id' }
+        script_version_id: { $ref: '#/components/schemas/Id' }
+        promotion_candidate_id: { $ref: '#/components/schemas/Id' }
+        title: { type: string }
+        description: { type: string }
+        cover_text: { type: string }
+        video_download_url: { type: string, format: uri }
+        publication_state: { type: string, enum: [needs_manual_checks, ready_for_manual_publish] }
+        checklist:
+          type: object
+          required: [account_eligible, product_eligible, edition_matches, rights_confirmed, manual_attachment_required]
+          properties:
+            account_eligible: { type: boolean }
+            product_eligible: { type: boolean }
+            edition_matches: { type: boolean }
+            rights_confirmed: { type: boolean }
+            manual_attachment_required: { type: boolean, const: true }
