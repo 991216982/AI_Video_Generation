@@ -1,0 +1,141 @@
+{
+  "sample_only": true,
+  "book_page": {
+    "items": [
+      {
+        "id": "00000000-0000-4000-8000-000000000011",
+        "owner_user_id": "00000000-0000-4000-8000-000000000099",
+        "created_at": "2026-10-29T00:00:00Z",
+        "title": "把日子写成地图",
+        "edition_label": "虚构演示版 1.0",
+        "author": "林例",
+        "isbn": null,
+        "publisher": null,
+        "original_opinion": "虚构样例中的原创观点，只供本地测试。",
+        "facts": [
+          {
+            "key": "title",
+            "value": "把日子写成地图",
+            "verification_status": "human_confirmed",
+            "source_note": "虚构演示数据，非真实图书",
+            "evidence_id": null
+          }
+        ]
+      }
+    ],
+    "next_cursor": null
+  },
+  "project_page": {
+    "items": [
+      {
+        "id": "00000000-0000-4000-8000-000000000003",
+        "owner_user_id": "00000000-0000-4000-8000-000000000099",
+        "created_at": "2026-10-29T00:01:00Z",
+        "book_id": "00000000-0000-4000-8000-000000000011",
+        "promotion_candidate_id": "00000000-0000-4000-8000-000000000004",
+        "target_audience": "成年读者",
+        "target_platform": "douyin",
+        "desired_seconds": 30,
+        "original_angle": "用自制图形讨论日常选择。",
+        "prohibited_claims": ["真实销量"],
+        "evidence_ids": []
+      }
+    ],
+    "next_cursor": null
+  },
+  "workspace": {
+    "project": {
+      "id": "00000000-0000-4000-8000-000000000003",
+      "owner_user_id": "00000000-0000-4000-8000-000000000099",
+      "created_at": "2026-10-29T00:01:00Z",
+      "book_id": "00000000-0000-4000-8000-000000000011",
+      "promotion_candidate_id": "00000000-0000-4000-8000-000000000004",
+      "target_audience": "成年读者",
+      "target_platform": "douyin",
+      "desired_seconds": 30,
+      "original_angle": "用自制图形讨论日常选择。",
+      "prohibited_claims": ["真实销量"],
+      "evidence_ids": []
+    },
+    "book": {
+      "id": "00000000-0000-4000-8000-000000000011",
+      "owner_user_id": "00000000-0000-4000-8000-000000000099",
+      "created_at": "2026-10-29T00:00:00Z",
+      "title": "把日子写成地图",
+      "edition_label": "虚构演示版 1.0",
+      "author": "林例",
+      "isbn": null,
+      "publisher": null,
+      "original_opinion": "虚构样例中的原创观点，只供本地测试。",
+      "facts": [
+        {
+          "key": "title",
+          "value": "把日子写成地图",
+          "verification_status": "human_confirmed",
+          "source_note": "虚构演示数据，非真实图书",
+          "evidence_id": null
+        }
+      ]
+    },
+    "promotion_candidate": {
+      "id": "00000000-0000-4000-8000-000000000004",
+      "owner_user_id": "00000000-0000-4000-8000-000000000099",
+      "created_at": "2026-10-29T00:00:30Z",
+      "book_id": "00000000-0000-4000-8000-000000000011",
+      "platform": "douyin",
+      "platform_product_id": "DEMO-NOT-REAL",
+      "product_url": "https://example.invalid/demo-product",
+      "eligibility_status": "unverified",
+      "eligibility_checked_at": null,
+      "eligibility_note": "虚构商品，未核验",
+      "eligibility_revision": 1,
+      "eligibility_checked_by_user_id": null
+    },
+    "evidence": [],
+    "script_versions": [],
+    "runs": [
+      {
+        "id": "00000000-0000-4000-8000-000000000002",
+        "project_id": "00000000-0000-4000-8000-000000000003",
+        "owner_user_id": "00000000-0000-4000-8000-000000000099",
+        "status": "queued",
+        "stage": "prepare",
+        "sequence": 1,
+        "attempt": 1,
+        "cancel_requested_at": null,
+        "error_code": null,
+        "error_message": null,
+        "created_at": "2026-10-29T00:02:00Z",
+        "updated_at": "2026-10-29T00:02:00Z"
+      }
+    ],
+    "render_jobs": [],
+    "publication_package": null
+  },
+  "eligibility_update": {
+    "eligibility_status": "manually_confirmed",
+    "expected_revision": 1,
+    "eligibility_note": "创作者已在本人账号后台核对；此处仅为虚构样例",
+    "confirmation_basis": "creator_account_backend"
+  },
+  "cancel_request": { "reason": "创作者决定改稿" },
+  "render_job": {
+    "id": "00000000-0000-4000-8000-000000000013",
+    "project_id": "00000000-0000-4000-8000-000000000003",
+    "script_version_id": "00000000-0000-4000-8000-000000000012",
+    "owner_user_id": "00000000-0000-4000-8000-000000000099",
+    "status": "failed",
+    "attempt": 1,
+    "cancel_requested_at": null,
+    "output_ref": null,
+    "error_message": "虚构样例：渲染未执行",
+    "created_at": "2026-10-29T00:03:00Z",
+    "updated_at": "2026-10-29T00:03:10Z"
+  },
+  "error": {
+    "code": "revision_conflict",
+    "message": "该商品资格记录已被更新，请刷新后重试",
+    "request_id": "demo-request-only",
+    "details": { "expected_revision": 1, "current_revision": 2 }
+  }
+}

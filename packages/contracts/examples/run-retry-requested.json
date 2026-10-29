@@ -1,0 +1,15 @@
+{
+  "event_id": "00000000-0000-4000-8000-000000000022",
+  "run_id": "00000000-0000-4000-8000-000000000002",
+  "project_id": "00000000-0000-4000-8000-000000000003",
+  "sequence": 7,
+  "type": "run.retry_requested",
+  "status": "queued",
+  "stage": "prepare",
+  "attempt": 2,
+  "occurred_at": "2026-10-29T00:05:00Z",
+  "script_version_id": null,
+  "render_id": null,
+  "reason_code": "retry_after_failure",
+  "message": "虚构样例：同一运行按原始输入重试"
+}

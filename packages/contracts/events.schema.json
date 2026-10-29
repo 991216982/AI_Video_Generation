@@ -10,13 +10,24 @@
     "run_id": {"type": "string", "format": "uuid"},
     "project_id": {"type": "string", "format": "uuid"},
     "sequence": {"type": "integer", "minimum": 1},
-    "type": {"enum": ["run.created", "run.stage_changed", "run.review_requested", "run.reviewed", "run.failed", "run.completed", "run.cancelled"]},
+    "type": {"enum": ["run.created", "run.stage_changed", "run.review_requested", "run.reviewed", "run.failed", "run.completed", "run.cancel_requested", "run.cancelled", "run.retry_requested"]},
     "status": {"enum": ["queued", "running", "waiting_review", "succeeded", "failed", "cancelled"]},
     "stage": {"enum": ["prepare", "script", "fact_check", "review", "storyboard", "render", "complete"]},
     "occurred_at": {"type": "string", "format": "date-time"},
+    "attempt": {"type": "integer", "minimum": 1},
     "script_version_id": {"type": ["string", "null"], "format": "uuid"},
     "render_id": {"type": ["string", "null"], "format": "uuid"},
     "reason_code": {"type": ["string", "null"]},
     "message": {"type": ["string", "null"]}
-  }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"type": {"const": "run.cancel_requested"}}},
+      "then": {"required": ["attempt"], "properties": {"status": {"const": "running"}}}
+    },
+    {
+      "if": {"properties": {"type": {"const": "run.retry_requested"}}},
+      "then": {"required": ["attempt"], "properties": {"status": {"const": "queued"}, "attempt": {"type": "integer", "minimum": 2}}}
+    }
+  ]
 }

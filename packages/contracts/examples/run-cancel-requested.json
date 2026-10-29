@@ -1,0 +1,15 @@
+{
+  "event_id": "00000000-0000-4000-8000-000000000021",
+  "run_id": "00000000-0000-4000-8000-000000000002",
+  "project_id": "00000000-0000-4000-8000-000000000003",
+  "sequence": 5,
+  "type": "run.cancel_requested",
+  "status": "running",
+  "stage": "script",
+  "attempt": 1,
+  "occurred_at": "2026-10-29T00:04:00Z",
+  "script_version_id": null,
+  "render_id": null,
+  "reason_code": "manual_cancel",
+  "message": "虚构样例：用户请求取消"
+}

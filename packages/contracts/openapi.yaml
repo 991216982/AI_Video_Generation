@@ -1,12 +1,30 @@
 openapi: 3.1.0
 info:
   title: Book Video Workspace API
-  version: 0.1.0
-  description: Stage 1 frozen draft. Local single-user implementation may use a development identity; every private record is owner-scoped.
+  version: 0.2.0
+  description: W2 contract-first draft. Local single-user implementation may use a development identity; every private record is owner-scoped.
 servers:
   - url: http://127.0.0.1:8000/api/v1
 paths:
   /books:
+    get:
+      operationId: listBooks
+      summary: List the current owner's book editions
+      parameters:
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Cursor' }
+        - name: q
+          in: query
+          required: false
+          description: Trimmed case-insensitive search across title, author, and ISBN
+          schema: { type: string, maxLength: 100 }
+      responses:
+        '200':
+          description: Stable descending created_at/id page
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BookPage' }
+        '422': { $ref: '#/components/responses/Error' }
     post:
       operationId: createBook
       summary: Create one book edition with manually supplied facts
@@ -61,6 +79,27 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/PromotionCandidate' }
         '404': { $ref: '#/components/responses/Error' }
+  /promotion-candidates/{candidate_id}/eligibility:
+    patch:
+      operationId: updatePromotionEligibility
+      summary: Record the owner's manual product eligibility check
+      description: This records a creator claim after checking their own platform account backend. It does not verify platform eligibility.
+      parameters:
+        - { $ref: '#/components/parameters/CandidateId' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PromotionEligibilityUpdate' }
+      responses:
+        '200':
+          description: Updated candidate; server assigns checked_at, checked_by, and next revision
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PromotionCandidate' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
   /evidence:
     post:
       operationId: createEvidence
@@ -77,6 +116,23 @@ paths:
               schema: { $ref: '#/components/schemas/Evidence' }
         '422': { $ref: '#/components/responses/Error' }
   /creative-projects:
+    get:
+      operationId: listCreativeProjects
+      summary: List the current owner's creative projects
+      parameters:
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Cursor' }
+        - name: book_id
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/Id' }
+      responses:
+        '200':
+          description: Stable descending created_at/id page
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CreativeProjectPage' }
+        '422': { $ref: '#/components/responses/Error' }
     post:
       operationId: createCreativeProject
       requestBody:
@@ -102,6 +158,19 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/CreativeProject' }
+        '404': { $ref: '#/components/responses/Error' }
+  /creative-projects/{project_id}/workspace:
+    get:
+      operationId: getCreativeWorkspace
+      summary: Reload the owner-scoped project and its local work state
+      parameters:
+        - { $ref: '#/components/parameters/ProjectId' }
+      responses:
+        '200':
+          description: Project, exact book edition, candidate, evidence, scripts, runs, renders, and latest package
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CreativeWorkspace' }
         '404': { $ref: '#/components/responses/Error' }
   /creative-projects/{project_id}/scripts:
     get:
@@ -163,6 +232,41 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Run' }
         '404': { $ref: '#/components/responses/Error' }
+  /runs/{run_id}/cancel:
+    post:
+      operationId: cancelRun
+      summary: Request cancellation of a queued, running, or review-waiting run
+      parameters:
+        - { $ref: '#/components/parameters/RunId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CancelRequest' }
+      responses:
+        '200':
+          description: Current run; an active worker may still be finishing cancellation
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Run' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+  /runs/{run_id}/retry:
+    post:
+      operationId: retryRun
+      summary: Requeue a failed run using its original immutable inputs
+      parameters:
+        - { $ref: '#/components/parameters/RunId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      responses:
+        '202':
+          description: Same run ID, incremented attempt, queued status
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Run' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
   /runs/{run_id}/events:
     get:
       operationId: streamRunEvents
@@ -221,6 +325,41 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/RenderJob' }
         '404': { $ref: '#/components/responses/Error' }
+  /renders/{render_id}/cancel:
+    post:
+      operationId: cancelRender
+      summary: Request cancellation of a queued or running render
+      parameters:
+        - { $ref: '#/components/parameters/RenderId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CancelRequest' }
+      responses:
+        '200':
+          description: Current render; an active worker may still be finishing cancellation
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RenderJob' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+  /renders/{render_id}/retry:
+    post:
+      operationId: retryRender
+      summary: Requeue a failed render with its original approved inputs
+      parameters:
+        - { $ref: '#/components/parameters/RenderId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      responses:
+        '202':
+          description: Same render ID, incremented attempt, queued status
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RenderJob' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
   /renders/{render_id}/download:
     get:
       operationId: downloadRender
@@ -255,6 +394,8 @@ components:
     RunId: { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/Id' } }
     RenderId: { name: render_id, in: path, required: true, schema: { $ref: '#/components/schemas/Id' } }
     IdempotencyKey: { name: Idempotency-Key, in: header, required: true, schema: { type: string, minLength: 8, maxLength: 128 } }
+    Limit: { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+    Cursor: { name: cursor, in: query, required: false, description: Opaque owner- and filter-bound cursor from the previous page, schema: { type: string, minLength: 1 } }
   responses:
     Error:
       description: Error
@@ -274,6 +415,11 @@ components:
         message: { type: string }
         request_id: { type: string }
         details: { type: object, additionalProperties: true }
+    CancelRequest:
+      type: object
+      required: [reason]
+      properties:
+        reason: { type: [string, 'null'], maxLength: 500 }
     BookFact:
       type: object
       required: [key, value, verification_status]
@@ -303,6 +449,12 @@ components:
             id: { $ref: '#/components/schemas/Id' }
             owner_user_id: { $ref: '#/components/schemas/Id' }
             created_at: { $ref: '#/components/schemas/Timestamp' }
+    BookPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/BookEdition' } }
+        next_cursor: { type: [string, 'null'] }
     PromotionCandidateCreate:
       type: object
       required: [book_id, platform, platform_product_id, product_url]
@@ -318,11 +470,35 @@ components:
       allOf:
         - { $ref: '#/components/schemas/PromotionCandidateCreate' }
         - type: object
-          required: [id, owner_user_id, created_at]
+          required: [id, owner_user_id, created_at, eligibility_status, eligibility_checked_at, eligibility_note, eligibility_revision, eligibility_checked_by_user_id]
           properties:
             id: { $ref: '#/components/schemas/Id' }
             owner_user_id: { $ref: '#/components/schemas/Id' }
             created_at: { $ref: '#/components/schemas/Timestamp' }
+            eligibility_revision: { type: integer, minimum: 1 }
+            eligibility_checked_by_user_id: { anyOf: [{ $ref: '#/components/schemas/Id' }, { type: 'null' }] }
+    PromotionEligibilityUpdate:
+      type: object
+      required: [eligibility_status, expected_revision, eligibility_note, confirmation_basis]
+      properties:
+        eligibility_status: { type: string, enum: [unverified, manually_confirmed] }
+        expected_revision: { type: integer, minimum: 1 }
+        eligibility_note: { type: [string, 'null'], maxLength: 500 }
+        confirmation_basis: { type: [string, 'null'], enum: [creator_account_backend, null] }
+      allOf:
+        - if:
+            properties:
+              eligibility_status: { const: manually_confirmed }
+          then:
+            properties:
+              eligibility_note: { type: string, minLength: 1, maxLength: 500 }
+              confirmation_basis: { const: creator_account_backend }
+        - if:
+            properties:
+              eligibility_status: { const: unverified }
+          then:
+            properties:
+              confirmation_basis: { type: 'null' }
     EvidenceCreate:
       type: object
       required: [source_type, source_note, observed_at, usage_basis]
@@ -367,6 +543,24 @@ components:
             id: { $ref: '#/components/schemas/Id' }
             owner_user_id: { $ref: '#/components/schemas/Id' }
             created_at: { $ref: '#/components/schemas/Timestamp' }
+    CreativeProjectPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/CreativeProject' } }
+        next_cursor: { type: [string, 'null'] }
+    CreativeWorkspace:
+      type: object
+      required: [project, book, promotion_candidate, evidence, script_versions, runs, render_jobs, publication_package]
+      properties:
+        project: { $ref: '#/components/schemas/CreativeProject' }
+        book: { $ref: '#/components/schemas/BookEdition' }
+        promotion_candidate: { $ref: '#/components/schemas/PromotionCandidate' }
+        evidence: { type: array, items: { $ref: '#/components/schemas/Evidence' } }
+        script_versions: { type: array, items: { $ref: '#/components/schemas/ScriptVersion' } }
+        runs: { type: array, items: { $ref: '#/components/schemas/Run' } }
+        render_jobs: { type: array, items: { $ref: '#/components/schemas/RenderJob' } }
+        publication_package: { anyOf: [{ $ref: '#/components/schemas/PublicationPackage' }, { type: 'null' }] }
     ScriptSegment:
       type: object
       required: [order, onscreen_text, narration, fact_keys, duration_seconds]
@@ -403,7 +597,7 @@ components:
         brief_version: { type: integer, minimum: 1 }
     Run:
       type: object
-      required: [id, project_id, owner_user_id, status, stage, sequence, created_at, updated_at]
+      required: [id, project_id, owner_user_id, status, stage, sequence, attempt, cancel_requested_at, created_at, updated_at]
       properties:
         id: { $ref: '#/components/schemas/Id' }
         project_id: { $ref: '#/components/schemas/Id' }
@@ -411,6 +605,8 @@ components:
         status: { $ref: '#/components/schemas/RunStatus' }
         stage: { type: string, enum: [prepare, script, fact_check, review, storyboard, render, complete] }
         sequence: { type: integer, minimum: 0 }
+        attempt: { type: integer, minimum: 1 }
+        cancel_requested_at: { anyOf: [{ $ref: '#/components/schemas/Timestamp' }, { type: 'null' }] }
         error_code: { type: [string, 'null'] }
         error_message: { type: [string, 'null'] }
         created_at: { $ref: '#/components/schemas/Timestamp' }
@@ -447,16 +643,19 @@ components:
         asset_rights: { type: array, items: { $ref: '#/components/schemas/AssetRights' } }
     RenderJob:
       type: object
-      required: [id, project_id, script_version_id, owner_user_id, status, created_at]
+      required: [id, project_id, script_version_id, owner_user_id, status, attempt, cancel_requested_at, created_at, updated_at]
       properties:
         id: { $ref: '#/components/schemas/Id' }
         project_id: { $ref: '#/components/schemas/Id' }
         script_version_id: { $ref: '#/components/schemas/Id' }
         owner_user_id: { $ref: '#/components/schemas/Id' }
         status: { $ref: '#/components/schemas/RunStatus' }
+        attempt: { type: integer, minimum: 1 }
+        cancel_requested_at: { anyOf: [{ $ref: '#/components/schemas/Timestamp' }, { type: 'null' }] }
         output_ref: { type: [string, 'null'] }
         error_message: { type: [string, 'null'] }
         created_at: { $ref: '#/components/schemas/Timestamp' }
+        updated_at: { $ref: '#/components/schemas/Timestamp' }
     PublicationPackage:
       type: object
       required: [id, project_id, book_id, script_version_id, promotion_candidate_id, render_id, title, description, video_download_url, publication_state, checklist]

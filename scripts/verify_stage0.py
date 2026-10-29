@@ -16,7 +16,15 @@ CONTRACTS = ROOT / "packages" / "contracts"
 def main() -> None:
     spec = yaml.safe_load((CONTRACTS / "openapi.yaml").read_text(encoding="utf-8"))
     assert spec["openapi"] == "3.1.0"
+    assert spec["info"]["version"] == "0.2.0"
     assert len(spec["paths"]) >= 10
+    operation_ids = [
+        operation["operationId"]
+        for methods in spec["paths"].values()
+        for operation in methods.values()
+        if isinstance(operation, dict) and "operationId" in operation
+    ]
+    assert len(operation_ids) == len(set(operation_ids))
     schemas = spec["components"]["schemas"]
     for name, schema in schemas.items():
         Draft202012Validator.check_schema(schema)
@@ -62,6 +70,23 @@ def main() -> None:
     assert event["sequence"] == 1
     package = json.loads((CONTRACTS / "examples" / "publication-package.json").read_text(encoding="utf-8"))
     Draft202012Validator(schemas["PublicationPackage"], resolver=resolver).validate(package)
+    w2 = json.loads((CONTRACTS / "examples" / "w2-workspace.json").read_text(encoding="utf-8"))
+    assert w2["sample_only"] is True
+    for sample_key, schema_name in (
+        ("book_page", "BookPage"),
+        ("project_page", "CreativeProjectPage"),
+        ("workspace", "CreativeWorkspace"),
+        ("eligibility_update", "PromotionEligibilityUpdate"),
+        ("cancel_request", "CancelRequest"),
+        ("render_job", "RenderJob"),
+        ("error", "ApiError"),
+    ):
+        Draft202012Validator(schemas[schema_name], resolver=resolver).validate(w2[sample_key])
+    invalid_confirmation = {**w2["eligibility_update"], "confirmation_basis": None}
+    assert not Draft202012Validator(schemas["PromotionEligibilityUpdate"], resolver=resolver).is_valid(invalid_confirmation)
+    for event_name in ("run-cancel-requested.json", "run-retry-requested.json"):
+        candidate = json.loads((CONTRACTS / "examples" / event_name).read_text(encoding="utf-8"))
+        Draft202012Validator(event_schema).validate(candidate)
     print("stage 0 contracts and examples: OK")
 
 
