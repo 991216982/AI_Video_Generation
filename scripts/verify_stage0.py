@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 
 import yaml
-from jsonschema import Draft202012Validator, RefResolver
+from jsonschema import Draft202012Validator, FormatChecker, RefResolver
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -16,7 +16,7 @@ CONTRACTS = ROOT / "packages" / "contracts"
 def main() -> None:
     spec = yaml.safe_load((CONTRACTS / "openapi.yaml").read_text(encoding="utf-8"))
     assert spec["openapi"] == "3.1.0"
-    assert spec["info"]["version"] == "0.2.0"
+    assert spec["info"]["version"] == "0.3.0"
     assert len(spec["paths"]) >= 10
     operation_ids = [
         operation["operationId"]
@@ -87,6 +87,41 @@ def main() -> None:
     for event_name in ("run-cancel-requested.json", "run-retry-requested.json"):
         candidate = json.loads((CONTRACTS / "examples" / event_name).read_text(encoding="utf-8"))
         Draft202012Validator(event_schema).validate(candidate)
+    g3 = json.loads((CONTRACTS / "examples" / "g3-contract.json").read_text(encoding="utf-8"))
+    assert g3["sample_only"] is True
+    for sample_key, schema_name in (
+        ("fact_revision_request", "BookFactRevisionRequest"),
+        ("fact_revision", "BookFactRevision"),
+        ("audio_asset", "AudioAsset"),
+        ("render_request", "RenderCreate"),
+        ("generation_result", "GenerationResult"),
+        ("cost_record", "ModelCostRecord"),
+    ):
+        Draft202012Validator(schemas[schema_name], resolver=resolver).validate(g3[sample_key])
+    Draft202012Validator(event_schema).validate(g3["event"])
+    assert not Draft202012Validator(event_schema).is_valid(
+        {key: value for key, value in g3["event"].items() if key != "cost_record_id"}
+    )
+    candidate_create = sample["promotion_candidate"]
+    candidate_create = {**candidate_create, "book_id": "00000000-0000-4000-8000-000000000003"}
+    create_validator = Draft202012Validator(schemas["PromotionCandidateCreate"], resolver=resolver)
+    assert create_validator.is_valid(candidate_create)
+    assert not create_validator.is_valid({**candidate_create, "eligibility_status": "manually_confirmed"})
+    assert not create_validator.is_valid({**candidate_create, "confirmation_basis": "creator_account_backend"})
+    assert not create_validator.is_valid({**candidate_create, "eligibility_checked_at": "2026-10-29T00:00:00Z"})
+    confirmed_response = {
+        **w2["workspace"]["promotion_candidate"],
+        "eligibility_status": "manually_confirmed",
+        "eligibility_checked_at": "2026-10-29T00:00:00Z",
+        "eligibility_checked_by_user_id": "00000000-0000-4000-8000-000000000099",
+    }
+    Draft202012Validator(schemas["PromotionCandidate"], resolver=resolver).validate(confirmed_response)
+    assert not Draft202012Validator(schemas["BookFactRevisionRequest"], resolver=resolver).is_valid(
+        {**g3["fact_revision_request"], "source_note": None}
+    )
+    assert not Draft202012Validator(schemas["RenderCreate"], resolver=resolver, format_checker=FormatChecker()).is_valid(
+        {**g3["render_request"], "audio_asset_id": "C:\\secret\\voice.wav"}
+    )
     print("stage 0 contracts and examples: OK")
 
 

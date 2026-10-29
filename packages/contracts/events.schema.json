@@ -10,13 +10,15 @@
     "run_id": {"type": "string", "format": "uuid"},
     "project_id": {"type": "string", "format": "uuid"},
     "sequence": {"type": "integer", "minimum": 1},
-    "type": {"enum": ["run.created", "run.stage_changed", "run.review_requested", "run.reviewed", "run.failed", "run.completed", "run.cancel_requested", "run.cancelled", "run.retry_requested"]},
+    "type": {"enum": ["run.created", "run.stage_changed", "run.review_requested", "run.reviewed", "run.failed", "run.completed", "run.cancel_requested", "run.cancelled", "run.retry_requested", "run.generation_completed", "run.generation_failed", "run.cost_recorded"]},
     "status": {"enum": ["queued", "running", "waiting_review", "succeeded", "failed", "cancelled"]},
     "stage": {"enum": ["prepare", "script", "fact_check", "review", "storyboard", "render", "complete"]},
     "occurred_at": {"type": "string", "format": "date-time"},
     "attempt": {"type": "integer", "minimum": 1},
     "script_version_id": {"type": ["string", "null"], "format": "uuid"},
     "render_id": {"type": ["string", "null"], "format": "uuid"},
+    "generation_result_id": {"type": "string", "format": "uuid"},
+    "cost_record_id": {"type": "string", "format": "uuid"},
     "reason_code": {"type": ["string", "null"]},
     "message": {"type": ["string", "null"]}
   },
@@ -28,6 +30,14 @@
     {
       "if": {"properties": {"type": {"const": "run.retry_requested"}}},
       "then": {"required": ["attempt"], "properties": {"status": {"const": "queued"}, "attempt": {"type": "integer", "minimum": 2}}}
+    },
+    {
+      "if": {"properties": {"type": {"enum": ["run.generation_completed", "run.generation_failed"]}}, "required": ["type"]},
+      "then": {"required": ["attempt", "generation_result_id"]}
+    },
+    {
+      "if": {"properties": {"type": {"const": "run.cost_recorded"}}, "required": ["type"]},
+      "then": {"required": ["attempt", "generation_result_id", "cost_record_id"]}
     }
   ]
 }

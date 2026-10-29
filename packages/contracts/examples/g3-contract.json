@@ -1,0 +1,85 @@
+{
+  "sample_only": true,
+  "fact_revision_request": {
+    "expected_revision": 1,
+    "value": "把日子写成地图",
+    "verification_status": "human_confirmed",
+    "source_note": "虚构样书的演示核对记录",
+    "evidence_id": null
+  },
+  "fact_revision": {
+    "book_id": "00000000-0000-4000-8000-000000000011",
+    "key": "title",
+    "revision": 2,
+    "value": "把日子写成地图",
+    "verification_status": "human_confirmed",
+    "source_note": "虚构样书的演示核对记录",
+    "evidence_id": null,
+    "created_at": "2026-10-29T01:00:00Z",
+    "created_by_user_id": "00000000-0000-4000-8000-000000000099"
+  },
+  "audio_asset": {
+    "id": "00000000-0000-4000-8000-000000000021",
+    "owner_user_id": "00000000-0000-4000-8000-000000000099",
+    "origin": "self_recorded_voice",
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "mime_type": "audio/wav",
+    "duration_ms": 30000,
+    "rights_attested": true,
+    "rights_proof_note": "虚构演示：创作者本人录制，未附真实音频",
+    "permitted_uses": "render_and_manual_publish",
+    "expires_at": null,
+    "usage_status": "allowed",
+    "created_at": "2026-10-29T01:01:00Z"
+  },
+  "render_request": {
+    "project_id": "00000000-0000-4000-8000-000000000003",
+    "script_version_id": "00000000-0000-4000-8000-000000000012",
+    "promotion_candidate_id": "00000000-0000-4000-8000-000000000004",
+    "width": 1080,
+    "height": 1920,
+    "audio_asset_id": "00000000-0000-4000-8000-000000000021",
+    "asset_rights": [{"origin": "self_created_text", "usage_status": "allowed"}]
+  },
+  "generation_result": {
+    "id": "00000000-0000-4000-8000-000000000022",
+    "run_id": "00000000-0000-4000-8000-000000000002",
+    "owner_user_id": "00000000-0000-4000-8000-000000000099",
+    "attempt": 1,
+    "invocation_key": "demo-run-2-draft-a",
+    "source": "deterministic_fixture",
+    "provider_key": "local_fixture",
+    "model_key": "fixture_v1",
+    "status": "succeeded",
+    "reason_code": null,
+    "input_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "output_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "script_version_id": "00000000-0000-4000-8000-000000000012",
+    "created_at": "2026-10-29T01:02:00Z"
+  },
+  "cost_record": {
+    "id": "00000000-0000-4000-8000-000000000023",
+    "run_id": "00000000-0000-4000-8000-000000000002",
+    "owner_user_id": "00000000-0000-4000-8000-000000000099",
+    "generation_result_id": "00000000-0000-4000-8000-000000000022",
+    "currency": "CNY",
+    "amount_minor": 0,
+    "missing_reason": null,
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "recorded_at": "2026-10-29T01:02:01Z"
+  },
+  "event": {
+    "event_id": "00000000-0000-4000-8000-000000000024",
+    "run_id": "00000000-0000-4000-8000-000000000002",
+    "project_id": "00000000-0000-4000-8000-000000000003",
+    "sequence": 4,
+    "type": "run.cost_recorded",
+    "status": "running",
+    "stage": "script",
+    "attempt": 1,
+    "generation_result_id": "00000000-0000-4000-8000-000000000022",
+    "cost_record_id": "00000000-0000-4000-8000-000000000023",
+    "occurred_at": "2026-10-29T01:02:01Z"
+  }
+}

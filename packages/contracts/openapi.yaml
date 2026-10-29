@@ -1,8 +1,8 @@
 openapi: 3.1.0
 info:
   title: Book Video Workspace API
-  version: 0.2.0
-  description: W2 contract-first draft. Local single-user implementation may use a development identity; every private record is owner-scoped.
+  version: 0.3.0
+  description: G3 frozen contract for W3 implementation. Local single-user implementation may use a development identity; every private record is owner-scoped.
 servers:
   - url: http://127.0.0.1:8000/api/v1
 paths:
@@ -51,6 +51,40 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/BookEdition' }
+        '404': { $ref: '#/components/responses/Error' }
+  /books/{book_id}/facts/{fact_key}:
+    patch:
+      operationId: reviseBookFact
+      summary: Append a fact revision for this exact book edition
+      parameters:
+        - { $ref: '#/components/parameters/BookId' }
+        - { $ref: '#/components/parameters/FactKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BookFactRevisionRequest' }
+      responses:
+        '200':
+          description: New fact revision; old revisions and approved script snapshots remain immutable
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BookFactRevision' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+  /books/{book_id}/facts/{fact_key}/revisions:
+    get:
+      operationId: listBookFactRevisions
+      parameters:
+        - { $ref: '#/components/parameters/BookId' }
+        - { $ref: '#/components/parameters/FactKey' }
+      responses:
+        '200':
+          description: All revisions of this owner's fact in ascending revision order
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/BookFactRevision' } }
         '404': { $ref: '#/components/responses/Error' }
   /promotion-candidates:
     post:
@@ -232,6 +266,30 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Run' }
         '404': { $ref: '#/components/responses/Error' }
+  /runs/{run_id}/generation-results:
+    get:
+      operationId: listGenerationResults
+      parameters:
+        - { $ref: '#/components/parameters/RunId' }
+      responses:
+        '200':
+          description: Model or deterministic generation attempts for this owner and run
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/GenerationResult' } }
+        '404': { $ref: '#/components/responses/Error' }
+  /runs/{run_id}/costs:
+    get:
+      operationId: listRunCosts
+      parameters:
+        - { $ref: '#/components/parameters/RunId' }
+      responses:
+        '200':
+          description: One cost record per actual model invocation; unknown amounts remain null
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/ModelCostRecord' } }
+        '404': { $ref: '#/components/responses/Error' }
   /runs/{run_id}/cancel:
     post:
       operationId: cancelRun
@@ -313,6 +371,45 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/RenderJob' }
         '409': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+  /audio-assets:
+    get:
+      operationId: listAudioAssets
+      summary: List the owner's registered audio assets
+      responses:
+        '200':
+          description: Metadata only; no local storage paths
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/AudioAsset' } }
+    post:
+      operationId: uploadAudioAsset
+      summary: Upload and register an owner's voice file and rights claim
+      description: Server checks ownership, SHA-256, media type, size and ffprobe duration before storing. A client path or URL is never accepted as render input.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema: { $ref: '#/components/schemas/AudioAssetUpload' }
+      responses:
+        '201':
+          description: Registered metadata with server-computed usage status
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AudioAsset' }
+        '422': { $ref: '#/components/responses/Error' }
+  /audio-assets/{audio_asset_id}:
+    get:
+      operationId: getAudioAsset
+      parameters:
+        - { $ref: '#/components/parameters/AudioAssetId' }
+      responses:
+        '200':
+          description: Current rights state evaluated at read time
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AudioAsset' }
+        '404': { $ref: '#/components/responses/Error' }
   /renders/{render_id}:
     get:
       operationId: getRender
@@ -389,7 +486,9 @@ paths:
 components:
   parameters:
     BookId: { name: book_id, in: path, required: true, schema: { $ref: '#/components/schemas/Id' } }
+    FactKey: { name: fact_key, in: path, required: true, description: URI-encoded fact key within one exact book edition, schema: { type: string, minLength: 1 } }
     CandidateId: { name: candidate_id, in: path, required: true, schema: { $ref: '#/components/schemas/Id' } }
+    AudioAssetId: { name: audio_asset_id, in: path, required: true, schema: { $ref: '#/components/schemas/Id' } }
     ProjectId: { name: project_id, in: path, required: true, schema: { $ref: '#/components/schemas/Id' } }
     RunId: { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/Id' } }
     RenderId: { name: render_id, in: path, required: true, schema: { $ref: '#/components/schemas/Id' } }
@@ -429,6 +528,35 @@ components:
         verification_status: { type: string, enum: [unverified, source_verified, human_confirmed] }
         source_note: { type: [string, 'null'] }
         evidence_id: { anyOf: [{ $ref: '#/components/schemas/Id' }, { type: 'null' }] }
+        revision: { type: integer, minimum: 1, description: Present on persisted facts; absent from create requests for v0.2 compatibility }
+    BookFactRevisionRequest:
+      type: object
+      additionalProperties: false
+      required: [expected_revision, value, verification_status, source_note]
+      properties:
+        expected_revision: { type: integer, minimum: 1 }
+        value: { type: string, minLength: 1 }
+        verification_status: { type: string, enum: [unverified, source_verified, human_confirmed] }
+        source_note: { type: [string, 'null'], maxLength: 1000 }
+        evidence_id: { anyOf: [{ $ref: '#/components/schemas/Id' }, { type: 'null' }] }
+      allOf:
+        - if: { properties: { verification_status: { const: source_verified } }, required: [verification_status] }
+          then: { anyOf: [{ properties: { source_note: { type: string, minLength: 1 } } }, { required: [evidence_id], properties: { evidence_id: { $ref: '#/components/schemas/Id' } } }] }
+        - if: { properties: { verification_status: { const: human_confirmed } }, required: [verification_status] }
+          then: { properties: { source_note: { type: string, minLength: 1 } } }
+    BookFactRevision:
+      type: object
+      required: [book_id, key, revision, value, verification_status, source_note, evidence_id, created_at, created_by_user_id]
+      properties:
+        book_id: { $ref: '#/components/schemas/Id' }
+        key: { type: string, minLength: 1 }
+        revision: { type: integer, minimum: 1 }
+        value: { type: string, minLength: 1 }
+        verification_status: { type: string, enum: [unverified, source_verified, human_confirmed] }
+        source_note: { type: [string, 'null'] }
+        evidence_id: { anyOf: [{ $ref: '#/components/schemas/Id' }, { type: 'null' }] }
+        created_at: { $ref: '#/components/schemas/Timestamp' }
+        created_by_user_id: { $ref: '#/components/schemas/Id' }
     BookCreate:
       type: object
       required: [title, edition_label, author, original_opinion, facts]
@@ -457,26 +585,32 @@ components:
         next_cursor: { type: [string, 'null'] }
     PromotionCandidateCreate:
       type: object
+      additionalProperties: false
       required: [book_id, platform, platform_product_id, product_url]
       properties:
         book_id: { $ref: '#/components/schemas/Id' }
         platform: { $ref: '#/components/schemas/Platform' }
         platform_product_id: { type: string, minLength: 1 }
         product_url: { type: string, format: uri }
-        eligibility_status: { type: string, enum: [unverified, manually_confirmed], default: unverified }
-        eligibility_checked_at: { anyOf: [{ $ref: '#/components/schemas/Timestamp' }, { type: 'null' }] }
+        eligibility_status: { type: string, const: unverified, default: unverified }
+        eligibility_checked_at: { type: 'null' }
         eligibility_note: { type: [string, 'null'] }
     PromotionCandidate:
-      allOf:
-        - { $ref: '#/components/schemas/PromotionCandidateCreate' }
-        - type: object
-          required: [id, owner_user_id, created_at, eligibility_status, eligibility_checked_at, eligibility_note, eligibility_revision, eligibility_checked_by_user_id]
-          properties:
-            id: { $ref: '#/components/schemas/Id' }
-            owner_user_id: { $ref: '#/components/schemas/Id' }
-            created_at: { $ref: '#/components/schemas/Timestamp' }
-            eligibility_revision: { type: integer, minimum: 1 }
-            eligibility_checked_by_user_id: { anyOf: [{ $ref: '#/components/schemas/Id' }, { type: 'null' }] }
+      type: object
+      required: [id, owner_user_id, created_at, book_id, platform, platform_product_id, product_url, eligibility_status, eligibility_checked_at, eligibility_note, eligibility_revision, eligibility_checked_by_user_id]
+      properties:
+        id: { $ref: '#/components/schemas/Id' }
+        owner_user_id: { $ref: '#/components/schemas/Id' }
+        created_at: { $ref: '#/components/schemas/Timestamp' }
+        book_id: { $ref: '#/components/schemas/Id' }
+        platform: { $ref: '#/components/schemas/Platform' }
+        platform_product_id: { type: string, minLength: 1 }
+        product_url: { type: string, format: uri }
+        eligibility_status: { type: string, enum: [unverified, manually_confirmed] }
+        eligibility_checked_at: { anyOf: [{ $ref: '#/components/schemas/Timestamp' }, { type: 'null' }] }
+        eligibility_note: { type: [string, 'null'] }
+        eligibility_revision: { type: integer, minimum: 1 }
+        eligibility_checked_by_user_id: { anyOf: [{ $ref: '#/components/schemas/Id' }, { type: 'null' }] }
     PromotionEligibilityUpdate:
       type: object
       required: [eligibility_status, expected_revision, eligibility_note, confirmation_basis]
@@ -532,6 +666,7 @@ components:
         target_platform: { $ref: '#/components/schemas/Platform' }
         desired_seconds: { type: integer, minimum: 20, maximum: 45 }
         original_angle: { type: string, minLength: 1 }
+        tone_instruction: { type: [string, 'null'], maxLength: 500, description: Optional creator voice or tone guidance; no new audience, platform, duration or claim fields }
         prohibited_claims: { type: array, items: { type: string }, default: [] }
         evidence_ids: { type: array, items: { $ref: '#/components/schemas/Id' }, default: [] }
     CreativeProject:
@@ -589,7 +724,57 @@ components:
             owner_user_id: { $ref: '#/components/schemas/Id' }
             version_number: { type: integer, minimum: 1 }
             review_status: { type: string, enum: [pending, approved, rejected] }
+            generation_result_id: { anyOf: [{ $ref: '#/components/schemas/Id' }, { type: 'null' }], description: Null for manual edits; generated drafts link to one completed result }
+            fact_revision_refs: { type: array, items: { $ref: '#/components/schemas/FactRevisionRef' }, description: Immutable book fact revisions checked for this script version }
             created_at: { $ref: '#/components/schemas/Timestamp' }
+    FactRevisionRef:
+      type: object
+      required: [key, revision]
+      properties:
+        key: { type: string, minLength: 1 }
+        revision: { type: integer, minimum: 1 }
+    GenerationResult:
+      type: object
+      required: [id, run_id, owner_user_id, attempt, invocation_key, source, provider_key, model_key, status, reason_code, input_digest, output_digest, script_version_id, created_at]
+      properties:
+        id: { $ref: '#/components/schemas/Id' }
+        run_id: { $ref: '#/components/schemas/Id' }
+        owner_user_id: { $ref: '#/components/schemas/Id' }
+        attempt: { type: integer, minimum: 1 }
+        invocation_key: { type: string, minLength: 1, description: Stable server-derived key reused on a retry of the same logical call }
+        source: { type: string, enum: [deterministic_fixture, external_model] }
+        provider_key: { type: string, minLength: 1 }
+        model_key: { type: string, minLength: 1 }
+        status: { type: string, enum: [succeeded, failed] }
+        reason_code: { type: [string, 'null'], enum: [null, provider_unavailable, provider_timeout, invalid_output, unsupported_claim, missing_fact_basis, prohibited_claim, cancelled] }
+        input_digest: { type: string, pattern: '^[a-f0-9]{64}$', description: SHA-256 of canonical request without prompt text }
+        output_digest: { type: [string, 'null'], description: SHA-256 of canonical structured output on success }
+        script_version_id: { anyOf: [{ $ref: '#/components/schemas/Id' }, { type: 'null' }] }
+        created_at: { $ref: '#/components/schemas/Timestamp' }
+      allOf:
+        - if: { properties: { status: { const: succeeded } }, required: [status] }
+          then: { properties: { reason_code: { type: 'null' }, output_digest: { type: string, pattern: '^[a-f0-9]{64}$' }, script_version_id: { $ref: '#/components/schemas/Id' } } }
+        - if: { properties: { status: { const: failed } }, required: [status] }
+          then: { properties: { reason_code: { type: string }, output_digest: { type: 'null' }, script_version_id: { type: 'null' } } }
+    ModelCostRecord:
+      type: object
+      required: [id, run_id, owner_user_id, generation_result_id, currency, amount_minor, missing_reason, input_tokens, output_tokens, recorded_at]
+      properties:
+        id: { $ref: '#/components/schemas/Id' }
+        run_id: { $ref: '#/components/schemas/Id' }
+        owner_user_id: { $ref: '#/components/schemas/Id' }
+        generation_result_id: { $ref: '#/components/schemas/Id', description: Unique; exactly one cost record for an actual invocation or zero-cost deterministic fixture }
+        currency: { type: string, pattern: '^[A-Z]{3}$' }
+        amount_minor: { type: [integer, 'null'], minimum: 0, description: Actual billed amount in minor units; null if unavailable, never an estimate disguised as billed cost }
+        missing_reason: { type: [string, 'null'] }
+        input_tokens: { type: [integer, 'null'], minimum: 0 }
+        output_tokens: { type: [integer, 'null'], minimum: 0 }
+        recorded_at: { $ref: '#/components/schemas/Timestamp' }
+      allOf:
+        - if: { properties: { amount_minor: { type: 'null' } }, required: [amount_minor] }
+          then: { properties: { missing_reason: { type: string, minLength: 1 } } }
+        - if: { properties: { amount_minor: { type: integer } }, required: [amount_minor] }
+          then: { properties: { missing_reason: { type: 'null' } } }
     RunCreate:
       type: object
       required: [brief_version]
@@ -631,8 +816,40 @@ components:
         permitted_uses: { type: array, items: { type: string }, default: [] }
         proof_ref: { type: [string, 'null'] }
         expires_at: { anyOf: [{ $ref: '#/components/schemas/Timestamp' }, { type: 'null' }] }
+    AudioAssetUpload:
+      type: object
+      additionalProperties: false
+      required: [file, sha256, origin, rights_attested, rights_proof_note, permitted_uses]
+      properties:
+        file: { type: string, format: binary, description: Audio bytes; server accepts only configured safe media formats and size limits }
+        sha256: { type: string, pattern: '^[a-f0-9]{64}$', description: Client digest verified against received bytes }
+        origin: { type: string, enum: [self_recorded_voice, licensed_voice] }
+        rights_attested: { type: boolean, const: true, description: Creator explicitly attests ownership or valid commercial permission }
+        rights_proof_note: { type: string, minLength: 1, maxLength: 1000, description: For self-recording identify creator's own recording; for licensed voice identify commercial permission scope }
+        permitted_uses: { type: string, const: render_and_manual_publish }
+        expires_at: { anyOf: [{ $ref: '#/components/schemas/Timestamp' }, { type: 'null' }] }
+      allOf:
+        - if: { properties: { origin: { const: licensed_voice } }, required: [origin] }
+          then: { required: [expires_at, permitted_uses], properties: { expires_at: { $ref: '#/components/schemas/Timestamp' } } }
+    AudioAsset:
+      type: object
+      required: [id, owner_user_id, origin, sha256, mime_type, duration_ms, rights_attested, rights_proof_note, permitted_uses, expires_at, usage_status, created_at]
+      properties:
+        id: { $ref: '#/components/schemas/Id' }
+        owner_user_id: { $ref: '#/components/schemas/Id' }
+        origin: { type: string, enum: [self_recorded_voice, licensed_voice] }
+        sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
+        mime_type: { type: string, enum: [audio/wav, audio/mpeg, audio/mp4] }
+        duration_ms: { type: integer, minimum: 1, maximum: 45000 }
+        rights_attested: { type: boolean }
+        rights_proof_note: { type: string }
+        permitted_uses: { type: string, enum: [render_and_manual_publish] }
+        expires_at: { anyOf: [{ $ref: '#/components/schemas/Timestamp' }, { type: 'null' }] }
+        usage_status: { type: string, enum: [allowed, blocked], description: Server-computed on read and before each render, including permission expiry }
+        created_at: { $ref: '#/components/schemas/Timestamp' }
     RenderCreate:
       type: object
+      additionalProperties: false
       required: [project_id, script_version_id, promotion_candidate_id, width, height, asset_rights]
       properties:
         project_id: { $ref: '#/components/schemas/Id' }
@@ -640,6 +857,7 @@ components:
         promotion_candidate_id: { $ref: '#/components/schemas/Id' }
         width: { type: integer, const: 1080 }
         height: { type: integer, const: 1920 }
+        audio_asset_id: { anyOf: [{ $ref: '#/components/schemas/Id' }, { type: 'null' }], description: Null makes a silent video; non-null must be an allowed owner-held audio asset. Never a client file path. }
         asset_rights: { type: array, items: { $ref: '#/components/schemas/AssetRights' } }
     RenderJob:
       type: object
@@ -648,6 +866,7 @@ components:
         id: { $ref: '#/components/schemas/Id' }
         project_id: { $ref: '#/components/schemas/Id' }
         script_version_id: { $ref: '#/components/schemas/Id' }
+        audio_asset_id: { anyOf: [{ $ref: '#/components/schemas/Id' }, { type: 'null' }] }
         owner_user_id: { $ref: '#/components/schemas/Id' }
         status: { $ref: '#/components/schemas/RunStatus' }
         attempt: { type: integer, minimum: 1 }
