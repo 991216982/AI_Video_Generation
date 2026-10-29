@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import base64
+import binascii
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -121,6 +123,123 @@ class DomainService:
     def get_book(self, book_id: UUID | str) -> JsonObject:
         return self._get_or_404("books", book_id, "Book edition")
 
+    def list_books(
+        self, *, limit: int = 20, cursor: str | None = None, q: str | None = None
+    ) -> JsonObject:
+        self._validate_page_limit(limit)
+        normalized_query = (q or "").strip().casefold() or None
+        if normalized_query and len(normalized_query) > 100:
+            raise DomainError(422, "invalid_query", "Book search query is too long")
+        filters = {"resource": "books", "q": normalized_query}
+        position = self._decode_page_cursor(cursor, filters) if cursor else None
+        sql = (
+            "SELECT id, created_at, payload FROM books WHERE owner_user_id = ?"
+        )
+        args: list[Any] = [self.owner_user_id]
+        if position:
+            sql += " AND (created_at < ? OR (created_at = ? AND id < ?))"
+            args.extend([position["created_at"], position["created_at"], position["id"]])
+        sql += " ORDER BY created_at DESC, id DESC"
+        with self.database.read() as conn:
+            rows = conn.execute(sql, args).fetchall()
+        matching: list[tuple[Any, JsonObject]] = []
+        for row in rows:
+            book = _payload(row)
+            if normalized_query is not None:
+                searchable = " ".join(
+                    str(book.get(field) or "") for field in ("title", "author", "isbn")
+                ).casefold()
+                if normalized_query not in searchable:
+                    continue
+            matching.append((row, book))
+        page = matching[:limit]
+        next_cursor = (
+            self._encode_page_cursor(filters, page[-1][0])
+            if len(matching) > limit and page
+            else None
+        )
+        return {"items": [book for _row, book in page], "next_cursor": next_cursor}
+
+    def list_creative_projects(
+        self,
+        *,
+        limit: int = 20,
+        cursor: str | None = None,
+        book_id: UUID | str | None = None,
+    ) -> JsonObject:
+        self._validate_page_limit(limit)
+        book_key = _as_uuid(book_id) if book_id is not None else None
+        filters = {"resource": "creative_projects", "book_id": book_key}
+        position = self._decode_page_cursor(cursor, filters) if cursor else None
+        sql = (
+            "SELECT id, created_at, payload FROM creative_projects WHERE owner_user_id = ?"
+        )
+        args: list[Any] = [self.owner_user_id]
+        if book_key is not None:
+            sql += " AND book_id = ?"
+            args.append(book_key)
+        if position:
+            sql += " AND (created_at < ? OR (created_at = ? AND id < ?))"
+            args.extend([position["created_at"], position["created_at"], position["id"]])
+        sql += " ORDER BY created_at DESC, id DESC"
+        with self.database.read() as conn:
+            rows = conn.execute(sql, args).fetchall()
+        page_rows = rows[: limit + 1]
+        has_more = len(page_rows) > limit
+        page_rows = page_rows[:limit]
+        return {
+            "items": [_payload(row) for row in page_rows],
+            "next_cursor": (
+                self._encode_page_cursor(filters, page_rows[-1])
+                if has_more and page_rows
+                else None
+            ),
+        }
+
+    def _encode_page_cursor(self, filters: JsonObject, row: Any) -> str:
+        payload = {
+            "version": 1,
+            "owner_user_id": self.owner_user_id,
+            "filters_hash": _request_hash(filters),
+            "created_at": row["created_at"],
+            "id": row["id"],
+        }
+        encoded = base64.urlsafe_b64encode(_json(payload).encode("utf-8"))
+        return encoded.decode("ascii").rstrip("=")
+
+    def _decode_page_cursor(
+        self, cursor: str | None, filters: JsonObject
+    ) -> JsonObject:
+        try:
+            if not cursor or len(cursor) > 2048:
+                raise ValueError("invalid cursor length")
+            raw = base64.b64decode(
+                cursor + "=" * (-len(cursor) % 4), altchars=b"-_", validate=True
+            )
+            payload = json.loads(raw.decode("utf-8"))
+            if (
+                not isinstance(payload, dict)
+                or payload.get("version") != 1
+                or payload.get("owner_user_id") != self.owner_user_id
+                or payload.get("filters_hash") != _request_hash(filters)
+            ):
+                raise ValueError("cursor does not match this owner or query")
+            created_at = payload["created_at"]
+            position_id = _as_uuid(payload["id"])
+            _timestamp(created_at)
+            if not isinstance(created_at, str):
+                raise ValueError("invalid timestamp")
+            return {"created_at": created_at, "id": position_id}
+        except DomainError as exc:
+            raise DomainError(422, "invalid_cursor", "Cursor is invalid for this query") from exc
+        except (ValueError, TypeError, KeyError, UnicodeDecodeError, json.JSONDecodeError, binascii.Error) as exc:
+            raise DomainError(422, "invalid_cursor", "Cursor is invalid for this query") from exc
+
+    @staticmethod
+    def _validate_page_limit(limit: int) -> None:
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 100:
+            raise DomainError(422, "invalid_limit", "Page limit must be between 1 and 100")
+
     def create_promotion_candidate(self, data: Any) -> JsonObject:
         candidate_data = _dump(data)
         book_id = _as_uuid(candidate_data["book_id"])
@@ -145,22 +264,105 @@ class DomainService:
                 raise not_found("Book edition")
             candidate_id = str(uuid4())
             created_at = _utc_now()
+            confirmed = candidate_data.get("eligibility_status") == MANUALLY_CONFIRMED
             result = {
                 **candidate_data,
                 "book_id": book_id,
                 "id": candidate_id,
                 "owner_user_id": self.owner_user_id,
                 "created_at": created_at,
+                "eligibility_checked_at": (
+                    candidate_data.get("eligibility_checked_at") if confirmed else None
+                ),
+                "eligibility_note": candidate_data.get("eligibility_note") if confirmed else None,
+                "eligibility_revision": 1,
+                "eligibility_checked_by_user_id": (
+                    self.owner_user_id if confirmed else None
+                ),
             }
             conn.execute(
                 "INSERT INTO promotion_candidates"
-                "(id, owner_user_id, book_id, created_at, payload) VALUES (?, ?, ?, ?, ?)",
-                (candidate_id, self.owner_user_id, book_id, created_at, _json(result)),
+                "(id, owner_user_id, book_id, created_at, eligibility_revision, "
+                "eligibility_checked_by_user_id, payload) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    candidate_id,
+                    self.owner_user_id,
+                    book_id,
+                    created_at,
+                    result["eligibility_revision"],
+                    result["eligibility_checked_by_user_id"],
+                    _json(result),
+                ),
             )
         return result
 
     def get_promotion_candidate(self, candidate_id: UUID | str) -> JsonObject:
         return self._get_or_404("promotion_candidates", candidate_id, "Promotion candidate")
+
+    def update_promotion_eligibility(
+        self, candidate_id: UUID | str, data: Any
+    ) -> JsonObject:
+        candidate_key = _as_uuid(candidate_id)
+        update = _dump(data)
+        target_status = update["eligibility_status"]
+        expected_revision = update["expected_revision"]
+        if target_status not in {"unverified", MANUALLY_CONFIRMED}:
+            raise DomainError(422, "validation_error", "Unknown eligibility status")
+        note = update.get("eligibility_note")
+        basis = update.get("confirmation_basis")
+        if target_status == MANUALLY_CONFIRMED and (
+            not isinstance(note, str)
+            or not note.strip()
+            or basis != "creator_account_backend"
+        ):
+            raise DomainError(
+                422,
+                "manual_check_required",
+                "Manual confirmation requires a note and creator account backend basis",
+            )
+        if target_status == "unverified" and basis is not None:
+            raise DomainError(
+                422,
+                "validation_error",
+                "Unverified eligibility cannot include a confirmation basis",
+            )
+        with self.database.transaction() as conn:
+            row = self._get_row(conn, "promotion_candidates", candidate_key)
+            if row is None:
+                raise not_found("Promotion candidate")
+            current = _payload(row)
+            current_revision = int(current.get("eligibility_revision", 1))
+            if current_revision != expected_revision:
+                raise conflict(
+                    "revision_conflict",
+                    "Promotion eligibility changed since it was loaded",
+                    expected_revision=expected_revision,
+                    current_revision=current_revision,
+                )
+            now = _utc_now()
+            confirmed = target_status == MANUALLY_CONFIRMED
+            updated = {
+                **current,
+                "eligibility_status": target_status,
+                "eligibility_checked_at": now if confirmed else None,
+                "eligibility_note": note.strip() if confirmed else None,
+                "eligibility_revision": current_revision + 1,
+                "eligibility_checked_by_user_id": self.owner_user_id if confirmed else None,
+            }
+            conn.execute(
+                "UPDATE promotion_candidates SET eligibility_revision = ?, "
+                "eligibility_checked_by_user_id = ?, payload = ? "
+                "WHERE id = ? AND owner_user_id = ? AND eligibility_revision = ?",
+                (
+                    updated["eligibility_revision"],
+                    updated["eligibility_checked_by_user_id"],
+                    _json(updated),
+                    candidate_key,
+                    self.owner_user_id,
+                    current_revision,
+                ),
+            )
+        return updated
 
     def create_evidence(self, data: Any) -> JsonObject:
         evidence_data = _dump(data)
@@ -246,6 +448,69 @@ class DomainService:
 
     def get_creative_project(self, project_id: UUID | str) -> JsonObject:
         return self._get_or_404("creative_projects", project_id, "Creative project")
+
+    def get_creative_workspace(self, project_id: UUID | str) -> JsonObject:
+        project_key = _as_uuid(project_id)
+        with self.database.read() as conn:
+            project = self._get(conn, "creative_projects", project_key)
+            if project is None:
+                raise not_found("Creative project")
+            book = self._get(conn, "books", project["book_id"])
+            candidate = self._get(
+                conn, "promotion_candidates", project["promotion_candidate_id"]
+            )
+            if book is None or candidate is None:
+                raise conflict(
+                    "project_references_missing", "Project references are unavailable"
+                )
+            evidence_ids = list(project.get("evidence_ids", []))
+            evidence_ids.extend(
+                fact["evidence_id"]
+                for fact in book.get("facts", [])
+                if fact.get("evidence_id")
+            )
+            evidence: list[JsonObject] = []
+            for evidence_id in dict.fromkeys(evidence_ids):
+                record = self._get(conn, "evidence", evidence_id)
+                if record is not None:
+                    evidence.append(record)
+            scripts = conn.execute(
+                "SELECT payload FROM script_versions WHERE project_id = ? "
+                "AND owner_user_id = ? ORDER BY version_number, id",
+                (project_key, self.owner_user_id),
+            ).fetchall()
+            runs = conn.execute(
+                "SELECT payload FROM runs WHERE project_id = ? AND owner_user_id = ? "
+                "ORDER BY created_at DESC, id DESC",
+                (project_key, self.owner_user_id),
+            ).fetchall()
+            renders = conn.execute(
+                "SELECT payload FROM render_jobs WHERE project_id = ? AND owner_user_id = ? "
+                "ORDER BY created_at DESC, id DESC",
+                (project_key, self.owner_user_id),
+            ).fetchall()
+            package_row = conn.execute(
+                "SELECT payload, render_id FROM publication_packages WHERE project_id = ? "
+                "AND owner_user_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+                (project_key, self.owner_user_id),
+            ).fetchone()
+            package = None
+            if package_row is not None:
+                render_row = self._get_row(conn, "render_jobs", package_row["render_id"])
+                if render_row is not None:
+                    package = self._refresh_publication_checklist(
+                        conn, _payload(package_row), render_row
+                    )
+        return {
+            "project": project,
+            "book": book,
+            "promotion_candidate": candidate,
+            "evidence": evidence,
+            "script_versions": [_payload(row) for row in scripts],
+            "runs": [_payload(row) for row in runs],
+            "render_jobs": [_payload(row) for row in renders],
+            "publication_package": package,
+        }
 
     def list_script_versions(self, project_id: UUID | str) -> list[JsonObject]:
         project_key = _as_uuid(project_id)
@@ -486,6 +751,8 @@ class DomainService:
                 "status": RunStatus.QUEUED.value,
                 "stage": RunStage.PREPARE.value,
                 "sequence": 1,
+                "attempt": 1,
+                "cancel_requested_at": None,
                 "error_code": None,
                 "error_message": None,
                 "created_at": now,
@@ -494,8 +761,9 @@ class DomainService:
             conn.execute(
                 "INSERT INTO runs"
                 "(id, owner_user_id, project_id, brief_version, status, stage, sequence, "
+                "attempt, cancel_requested_at, "
                 "idempotency_key, request_hash, created_at, updated_at, payload) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     run_id,
                     self.owner_user_id,
@@ -504,6 +772,8 @@ class DomainService:
                     result["status"],
                     result["stage"],
                     result["sequence"],
+                    result["attempt"],
+                    result["cancel_requested_at"],
                     idempotency_key,
                     hash_value,
                     now,
@@ -540,6 +810,231 @@ class DomainService:
 
     def get_run(self, run_id: UUID | str) -> JsonObject:
         return self._get_or_404("runs", run_id, "Run")
+
+    def cancel_run(
+        self, run_id: UUID | str, data: Any, idempotency_key: str
+    ) -> JsonObject:
+        run_key = _as_uuid(run_id)
+        request_data = _dump(data)
+        self._validate_idempotency_key(idempotency_key)
+        reason = request_data.get("reason")
+        operation = "cancel_run"
+        request_hash = _request_hash(
+            {"operation": operation, "run_id": run_key, "reason": reason}
+        )
+        with self.database.transaction() as conn:
+            replay = self._get_idempotent_mutation(
+                conn, idempotency_key, operation, run_key, request_hash
+            )
+            if replay is not None:
+                return replay
+            row = self._get_row(conn, "runs", run_key)
+            if row is None:
+                raise not_found("Run")
+            current = _payload(row)
+            status = current["status"]
+            result = current
+            if status == RunStatus.RUNNING.value:
+                if current.get("cancel_requested_at") is None:
+                    now = _utc_now()
+                    result = {
+                        **current,
+                        "cancel_requested_at": now,
+                        "sequence": current["sequence"] + 1,
+                        "updated_at": now,
+                    }
+                    conn.execute(
+                        "UPDATE runs SET sequence = ?, cancel_requested_at = ?, "
+                        "updated_at = ?, payload = ? WHERE id = ? AND owner_user_id = ?",
+                        (
+                            result["sequence"],
+                            now,
+                            now,
+                            _json(result),
+                            run_key,
+                            self.owner_user_id,
+                        ),
+                    )
+                    self._insert_event(
+                        conn,
+                        self._run_event(
+                            run=result,
+                            event_type=RunEventType.CANCEL_REQUESTED.value,
+                            occurred_at=now,
+                            sequence=result["sequence"],
+                            reason_code="creator_requested",
+                            message=reason,
+                            attempt=result["attempt"],
+                        ),
+                    )
+            elif status in {RunStatus.QUEUED.value, RunStatus.WAITING_REVIEW.value}:
+                now = _utc_now()
+                result = {
+                    **current,
+                    "status": RunStatus.CANCELLED.value,
+                    "error_code": None,
+                    "error_message": None,
+                    "sequence": current["sequence"] + 1,
+                    "updated_at": now,
+                }
+                conn.execute(
+                    "UPDATE runs SET status = ?, sequence = ?, updated_at = ?, "
+                    "execution_claimed_at = NULL, review_resume_claimed_at = NULL, payload = ? "
+                    "WHERE id = ? AND owner_user_id = ?",
+                    (
+                        result["status"],
+                        result["sequence"],
+                        now,
+                        _json(result),
+                        run_key,
+                        self.owner_user_id,
+                    ),
+                )
+                self._insert_event(
+                    conn,
+                    self._run_event(
+                        run=result,
+                        event_type=RunEventType.CANCELLED.value,
+                        occurred_at=now,
+                        sequence=result["sequence"],
+                        reason_code="creator_cancelled",
+                        message=reason,
+                    ),
+                )
+            elif status != RunStatus.CANCELLED.value:
+                raise conflict(
+                    "invalid_state_transition",
+                    "Only queued, running, or review-waiting runs can be cancelled",
+                    current_status=status,
+                )
+            self._store_idempotent_mutation(
+                conn, idempotency_key, operation, run_key, request_hash, result
+            )
+        return result
+
+    def retry_run(self, run_id: UUID | str, idempotency_key: str) -> JsonObject:
+        run_key = _as_uuid(run_id)
+        self._validate_idempotency_key(idempotency_key)
+        operation = "retry_run"
+        request_hash = _request_hash({"operation": operation, "run_id": run_key})
+        with self.database.transaction() as conn:
+            replay = self._get_idempotent_mutation(
+                conn, idempotency_key, operation, run_key, request_hash
+            )
+            if replay is not None:
+                return replay
+            row = self._get_row(conn, "runs", run_key)
+            if row is None:
+                raise not_found("Run")
+            current = _payload(row)
+            if current["status"] != RunStatus.FAILED.value:
+                raise conflict(
+                    "invalid_state_transition",
+                    "Only a failed run can be retried",
+                    current_status=current["status"],
+                )
+            now = _utc_now()
+            next_attempt = current["attempt"] + 1
+            result = {
+                **current,
+                "status": RunStatus.QUEUED.value,
+                "stage": RunStage.PREPARE.value,
+                "sequence": current["sequence"] + 1,
+                "attempt": next_attempt,
+                "cancel_requested_at": None,
+                "error_code": None,
+                "error_message": None,
+                "updated_at": now,
+            }
+            conn.execute(
+                "UPDATE runs SET status = ?, stage = ?, sequence = ?, attempt = ?, "
+                "cancel_requested_at = NULL, execution_claimed_at = NULL, updated_at = ?, "
+                "review_resume_claimed_at = NULL, "
+                "payload = ? WHERE id = ? AND owner_user_id = ? AND status = 'failed'",
+                (
+                    result["status"],
+                    result["stage"],
+                    result["sequence"],
+                    next_attempt,
+                    now,
+                    _json(result),
+                    run_key,
+                    self.owner_user_id,
+                ),
+            )
+            self._insert_event(
+                conn,
+                self._run_event(
+                    run=result,
+                    event_type=RunEventType.RETRY_REQUESTED.value,
+                    occurred_at=now,
+                    sequence=result["sequence"],
+                    reason_code="creator_retry_requested",
+                    message=f"Retry queued for attempt {next_attempt}",
+                    attempt=next_attempt,
+                ),
+            )
+            self._store_idempotent_mutation(
+                conn, idempotency_key, operation, run_key, request_hash, result
+            )
+        return result
+
+    def is_run_cancel_requested(self, run_id: UUID | str) -> bool:
+        return self.get_run(run_id).get("cancel_requested_at") is not None
+
+    def confirm_run_cancelled(
+        self, run_id: UUID | str, message: str | None = None
+    ) -> JsonObject:
+        run_key = _as_uuid(run_id)
+        with self.database.transaction() as conn:
+            row = self._get_row(conn, "runs", run_key)
+            if row is None:
+                raise not_found("Run")
+            current = _payload(row)
+            if current["status"] == RunStatus.CANCELLED.value:
+                return current
+            if (
+                current["status"] != RunStatus.RUNNING.value
+                or current.get("cancel_requested_at") is None
+            ):
+                raise conflict(
+                    "invalid_state_transition",
+                    "Only a running run with a cancellation request can confirm cancellation",
+                )
+            now = _utc_now()
+            result = {
+                **current,
+                "status": RunStatus.CANCELLED.value,
+                "sequence": current["sequence"] + 1,
+                "error_code": None,
+                "error_message": None,
+                "updated_at": now,
+            }
+            conn.execute(
+                "UPDATE runs SET status = ?, sequence = ?, updated_at = ?, "
+                "execution_claimed_at = NULL, review_resume_claimed_at = NULL, payload = ? "
+                "WHERE id = ? AND owner_user_id = ?",
+                (
+                    result["status"],
+                    result["sequence"],
+                    now,
+                    _json(result),
+                    run_key,
+                    self.owner_user_id,
+                ),
+            )
+            self._insert_event(
+                conn,
+                self._run_event(
+                    run=result,
+                    event_type=RunEventType.CANCELLED.value,
+                    occurred_at=now,
+                    sequence=result["sequence"],
+                    reason_code="worker_cancelled",
+                    message=message,
+                ),
+            )
+        return result
 
     def get_run_snapshot(self, run_id: UUID | str) -> JsonObject:
         """Return a queued/active run with its stored brief version and inputs."""
@@ -589,11 +1084,13 @@ class DomainService:
                 "updated_at": now,
             }
             conn.execute(
-                "UPDATE runs SET status = ?, sequence = ?, updated_at = ?, payload = ? "
+                "UPDATE runs SET status = ?, sequence = ?, execution_claimed_at = ?, "
+                "updated_at = ?, payload = ? "
                 "WHERE id = ? AND owner_user_id = ? AND status = 'queued'",
                 (
                     updated["status"],
                     sequence,
+                    now,
                     now,
                     _json(updated),
                     current["id"],
@@ -609,6 +1106,72 @@ class DomainService:
             )
             self._insert_event(conn, event)
         return updated
+
+    def claim_next_resumable_run(
+        self, *, lease_seconds: int = 300
+    ) -> JsonObject | None:
+        """Claim an expired non-review run lease so a new worker can resume its checkpoint."""
+
+        self._validate_run_lease(lease_seconds)
+        now_dt = datetime.now(timezone.utc)
+        expired_before = (now_dt - timedelta(seconds=lease_seconds)).isoformat(
+            timespec="milliseconds"
+        ).replace("+00:00", "Z")
+        claimed_at = _utc_now()
+        with self.database.transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM runs WHERE owner_user_id = ? AND status = 'running' "
+                "AND stage <> 'review' "
+                "AND (execution_claimed_at IS NULL OR execution_claimed_at <= ?) "
+                "ORDER BY COALESCE(execution_claimed_at, created_at), created_at, id LIMIT 1",
+                (self.owner_user_id, expired_before),
+            ).fetchone()
+            if row is None:
+                return None
+            run = _payload(row)
+            updated = conn.execute(
+                "UPDATE runs SET execution_claimed_at = ? WHERE id = ? "
+                "AND owner_user_id = ? AND status = 'running' "
+                "AND (execution_claimed_at IS NULL OR execution_claimed_at <= ?)",
+                (claimed_at, run["id"], self.owner_user_id, expired_before),
+            )
+            if updated.rowcount != 1:
+                return None
+        return run
+
+    def renew_run_execution_claim(self, run_id: UUID | str) -> bool:
+        run_key = _as_uuid(run_id)
+        claimed_at = _utc_now()
+        with self.database.transaction() as conn:
+            row = self._get_row(conn, "runs", run_key)
+            if row is None:
+                raise not_found("Run")
+            run = _payload(row)
+            if (
+                run["status"] != RunStatus.RUNNING.value
+                or run["stage"] == RunStage.REVIEW.value
+                or run.get("cancel_requested_at") is not None
+            ):
+                return False
+            cursor = conn.execute(
+                "UPDATE runs SET execution_claimed_at = ? WHERE id = ? "
+                "AND owner_user_id = ? AND status = 'running' "
+                "AND stage <> 'review' AND cancel_requested_at IS NULL",
+                (claimed_at, run_key, self.owner_user_id),
+            )
+            return cursor.rowcount == 1
+
+    def release_run_execution_claim(self, run_id: UUID | str) -> None:
+        run_key = _as_uuid(run_id)
+        with self.database.transaction() as conn:
+            row = self._get_row(conn, "runs", run_key)
+            if row is None:
+                raise not_found("Run")
+            conn.execute(
+                "UPDATE runs SET execution_claimed_at = NULL WHERE id = ? "
+                "AND owner_user_id = ?",
+                (run_key, self.owner_user_id),
+            )
 
     def claim_next_reviewed_run(self, *, lease_seconds: int = 300) -> JsonObject | None:
         """Claim one human-reviewed run for LangGraph resume, with an expiring lease.
@@ -701,27 +1264,157 @@ class DomainService:
         """Atomically claim one queued render for a worker process."""
 
         with self.database.transaction() as conn:
-            row = conn.execute(
+            rows = conn.execute(
                 "SELECT * FROM render_jobs WHERE owner_user_id = ? AND status = 'queued' "
-                "ORDER BY created_at, id LIMIT 1",
+                "ORDER BY created_at, id",
                 (self.owner_user_id,),
-            ).fetchone()
+            ).fetchall()
+            for row in rows:
+                current = _payload(row)
+                candidate = self._get(
+                    conn, "promotion_candidates", row["promotion_candidate_id"]
+                )
+                if candidate is None or candidate.get("eligibility_status") != MANUALLY_CONFIRMED:
+                    now = _utc_now()
+                    failed = {
+                        **current,
+                        "status": RunStatus.FAILED.value,
+                        "output_ref": None,
+                        "error_message": (
+                            "Promotion eligibility must be manually confirmed before rendering"
+                        ),
+                        "updated_at": now,
+                    }
+                    conn.execute(
+                        "UPDATE render_jobs SET status = ?, execution_claimed_at = NULL, "
+                        "updated_at = ?, payload = ? "
+                        "WHERE id = ? AND owner_user_id = ? AND status = 'queued'",
+                        (
+                            failed["status"],
+                            now,
+                            _json(failed),
+                            current["id"],
+                            self.owner_user_id,
+                        ),
+                    )
+                    continue
+                now = _utc_now()
+                updated = {
+                    **current,
+                    "status": RunStatus.RUNNING.value,
+                    "error_message": None,
+                    "updated_at": now,
+                }
+                conn.execute(
+                    "UPDATE render_jobs SET status = ?, execution_claimed_at = ?, "
+                    "updated_at = ?, payload = ? "
+                    "WHERE id = ? AND owner_user_id = ? AND status = 'queued'",
+                    (
+                        updated["status"],
+                        now,
+                        now,
+                        _json(updated),
+                        current["id"],
+                        self.owner_user_id,
+                    ),
+                )
+                return updated
+        return None
+
+    def claim_next_resumable_render(
+        self, *, lease_seconds: int = 300
+    ) -> JsonObject | None:
+        """Claim an expired running render so a worker can safely resume or confirm cancel."""
+
+        self._validate_run_lease(lease_seconds)
+        expired_before = (
+            datetime.now(timezone.utc) - timedelta(seconds=lease_seconds)
+        ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        claimed_at = _utc_now()
+        with self.database.transaction() as conn:
+            rows = conn.execute(
+                "SELECT * FROM render_jobs WHERE owner_user_id = ? AND status = 'running' "
+                "AND (execution_claimed_at IS NULL OR execution_claimed_at <= ?) "
+                "ORDER BY COALESCE(execution_claimed_at, created_at), created_at, id",
+                (self.owner_user_id, expired_before),
+            ).fetchall()
+            for row in rows:
+                current = _payload(row)
+                candidate = self._get(
+                    conn, "promotion_candidates", row["promotion_candidate_id"]
+                )
+                cancel_requested = current.get("cancel_requested_at") is not None
+                if (
+                    not cancel_requested
+                    and (
+                        candidate is None
+                        or candidate.get("eligibility_status") != MANUALLY_CONFIRMED
+                    )
+                ):
+                    now = _utc_now()
+                    failed = {
+                        **current,
+                        "status": RunStatus.FAILED.value,
+                        "output_ref": None,
+                        "error_message": (
+                            "Promotion eligibility must be manually confirmed before rendering"
+                        ),
+                        "updated_at": now,
+                    }
+                    conn.execute(
+                        "UPDATE render_jobs SET status = ?, execution_claimed_at = NULL, "
+                        "updated_at = ?, payload = ? WHERE id = ? AND owner_user_id = ?",
+                        (
+                            failed["status"],
+                            now,
+                            _json(failed),
+                            current["id"],
+                            self.owner_user_id,
+                        ),
+                    )
+                    continue
+                claimed = conn.execute(
+                    "UPDATE render_jobs SET execution_claimed_at = ? WHERE id = ? "
+                    "AND owner_user_id = ? AND status = 'running' "
+                    "AND (execution_claimed_at IS NULL OR execution_claimed_at <= ?)",
+                    (claimed_at, current["id"], self.owner_user_id, expired_before),
+                )
+                if claimed.rowcount == 1:
+                    return current
+        return None
+
+    def renew_render_execution_claim(self, render_id: UUID | str) -> bool:
+        render_key = _as_uuid(render_id)
+        claimed_at = _utc_now()
+        with self.database.transaction() as conn:
+            row = self._get_row(conn, "render_jobs", render_key)
             if row is None:
-                return None
-            current = _payload(row)
-            updated = {**current, "status": RunStatus.RUNNING.value, "error_message": None}
-            conn.execute(
-                "UPDATE render_jobs SET status = ?, updated_at = ?, payload = ? "
-                "WHERE id = ? AND owner_user_id = ? AND status = 'queued'",
-                (
-                    updated["status"],
-                    _utc_now(),
-                    _json(updated),
-                    current["id"],
-                    self.owner_user_id,
-                ),
+                raise not_found("Render job")
+            render = _payload(row)
+            if (
+                render["status"] != RunStatus.RUNNING.value
+                or render.get("cancel_requested_at") is not None
+            ):
+                return False
+            cursor = conn.execute(
+                "UPDATE render_jobs SET execution_claimed_at = ? WHERE id = ? "
+                "AND owner_user_id = ? AND status = 'running' "
+                "AND cancel_requested_at IS NULL",
+                (claimed_at, render_key, self.owner_user_id),
             )
-        return updated
+            return cursor.rowcount == 1
+
+    def release_render_execution_claim(self, render_id: UUID | str) -> None:
+        render_key = _as_uuid(render_id)
+        with self.database.transaction() as conn:
+            row = self._get_row(conn, "render_jobs", render_key)
+            if row is None:
+                raise not_found("Render job")
+            conn.execute(
+                "UPDATE render_jobs SET execution_claimed_at = NULL WHERE id = ? "
+                "AND owner_user_id = ?",
+                (render_key, self.owner_user_id),
+            )
 
     def get_generation_snapshot(self, project_id: UUID | str) -> JsonObject:
         """Return the owner-scoped, manual-input snapshot consumed by script generation."""
@@ -834,6 +1527,20 @@ class DomainService:
             current = _payload(row)
             target_status = status or current["status"]
             target_stage = stage or current["stage"]
+            if current.get("cancel_requested_at") and target_status != RunStatus.CANCELLED.value:
+                raise conflict(
+                    "invalid_state_transition",
+                    "A cancellation-requested run can only be confirmed as cancelled",
+                )
+            if (
+                target_status == RunStatus.CANCELLED.value
+                and current["status"] == RunStatus.RUNNING.value
+                and current.get("cancel_requested_at") is None
+            ):
+                raise conflict(
+                    "invalid_state_transition",
+                    "A running run must have a cancellation request before cancellation",
+                )
             validate_run_transition(current["status"], target_status)
             try:
                 target_stage = RunStage(target_stage).value
@@ -844,7 +1551,9 @@ class DomainService:
                     "run_unchanged", "A run update must change its status or stage"
                 )
             resolved_event_type = event_type or self._event_type_for_status(target_status)
-            self._validate_event_type(resolved_event_type, target_status)
+            self._validate_event_type(
+                resolved_event_type, target_status, current.get("attempt")
+            )
             if resolved_event_type in {
                 RunEventType.CREATED.value,
                 RunEventType.REVIEWED.value,
@@ -865,14 +1574,24 @@ class DomainService:
                 "error_message": message if target_status == "failed" else None,
                 "updated_at": now,
             }
+            execution_claimed_at = (
+                now
+                if target_status == RunStatus.RUNNING.value
+                and target_stage != RunStage.REVIEW.value
+                else None
+            )
             conn.execute(
-                "UPDATE runs SET status = ?, stage = ?, sequence = ?, updated_at = ?, "
+                "UPDATE runs SET status = ?, stage = ?, sequence = ?, attempt = ?, "
+                "cancel_requested_at = ?, execution_claimed_at = ?, updated_at = ?, "
                 "review_resume_claimed_at = NULL, payload = ? "
                 "WHERE id = ? AND owner_user_id = ?",
                 (
                     target_status,
                     target_stage,
                     sequence,
+                    updated["attempt"],
+                    updated.get("cancel_requested_at"),
+                    execution_claimed_at,
                     now,
                     _json(updated),
                     run_key,
@@ -949,6 +1668,8 @@ class DomainService:
             "reason_code": raw.get("reason_code"),
             "message": raw.get("message"),
         }
+        if "attempt" in raw:
+            event["attempt"] = raw["attempt"]
         with self.database.transaction() as conn:
             by_event_id = conn.execute(
                 "SELECT payload FROM run_events WHERE event_id = ? AND owner_user_id = ?",
@@ -986,10 +1707,12 @@ class DomainService:
             if event_type in {
                 RunEventType.CREATED.value,
                 RunEventType.REVIEWED.value,
+                RunEventType.CANCEL_REQUESTED.value,
+                RunEventType.RETRY_REQUESTED.value,
             }:
                 raise conflict(
                     "reserved_run_event",
-                    "Run creation and review events are persisted by their domain operations",
+                    "Run creation, review, cancellation, and retry events are persisted by domain operations",
                 )
             if sequence != run["sequence"] + 1:
                 raise conflict(
@@ -998,8 +1721,22 @@ class DomainService:
                     expected_sequence=run["sequence"] + 1,
                     actual_sequence=sequence,
                 )
+            if (
+                event_status == RunStatus.CANCELLED.value
+                and run["status"] == RunStatus.RUNNING.value
+                and run.get("cancel_requested_at") is None
+            ):
+                raise conflict(
+                    "invalid_state_transition",
+                    "A running run must have a cancellation request before cancellation",
+                )
+            if run.get("cancel_requested_at") and event_status != RunStatus.CANCELLED.value:
+                raise conflict(
+                    "invalid_state_transition",
+                    "A cancellation-requested run can only be confirmed as cancelled",
+                )
             validate_run_transition(run["status"], event_status)
-            self._validate_event_type(event_type, event_status)
+            self._validate_event_type(event_type, event_status, raw.get("attempt"))
             if (
                 event_status == run["status"]
                 and event_stage == run["stage"]
@@ -1023,14 +1760,24 @@ class DomainService:
                 "error_message": event["message"] if event_status == "failed" else None,
                 "updated_at": event["occurred_at"],
             }
+            execution_claimed_at = (
+                event["occurred_at"]
+                if event_status == RunStatus.RUNNING.value
+                and event_stage != RunStage.REVIEW.value
+                else None
+            )
             conn.execute(
-                "UPDATE runs SET status = ?, stage = ?, sequence = ?, updated_at = ?, "
+                "UPDATE runs SET status = ?, stage = ?, sequence = ?, attempt = ?, "
+                "cancel_requested_at = ?, execution_claimed_at = ?, updated_at = ?, "
                 "review_resume_claimed_at = NULL, payload = ? "
                 "WHERE id = ? AND owner_user_id = ?",
                 (
                     event_status,
                     event_stage,
                     sequence,
+                    updated["attempt"],
+                    updated.get("cancel_requested_at"),
+                    execution_claimed_at,
                     event["occurred_at"],
                     _json(updated),
                     run_key,
@@ -1132,7 +1879,7 @@ class DomainService:
             }
             conn.execute(
                 "UPDATE runs SET status = ?, stage = ?, sequence = ?, updated_at = ?, "
-                "review_resume_claimed_at = NULL, payload = ? "
+                "execution_claimed_at = NULL, review_resume_claimed_at = NULL, payload = ? "
                 "WHERE id = ? AND owner_user_id = ?",
                 (
                     updated_run["status"],
@@ -1229,15 +1976,19 @@ class DomainService:
                 "script_version_id": script_key,
                 "owner_user_id": self.owner_user_id,
                 "status": RunStatus.QUEUED.value,
+                "attempt": 1,
+                "cancel_requested_at": None,
                 "output_ref": None,
                 "error_message": None,
                 "created_at": now,
+                "updated_at": now,
             }
             conn.execute(
                 "INSERT INTO render_jobs"
                 "(id, owner_user_id, project_id, script_version_id, promotion_candidate_id, "
-                "status, idempotency_key, request_hash, asset_rights, created_at, updated_at, payload) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "status, idempotency_key, request_hash, asset_rights, attempt, "
+                "cancel_requested_at, created_at, updated_at, payload) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     render_id,
                     self.owner_user_id,
@@ -1248,6 +1999,8 @@ class DomainService:
                     idempotency_key,
                     hash_value,
                     _json(normalized_rights),
+                    result["attempt"],
+                    result["cancel_requested_at"],
                     now,
                     now,
                     _json(result),
@@ -1273,6 +2026,167 @@ class DomainService:
     def get_render(self, render_id: UUID | str) -> JsonObject:
         return self._get_or_404("render_jobs", render_id, "Render job")
 
+    def cancel_render(
+        self, render_id: UUID | str, data: Any, idempotency_key: str
+    ) -> JsonObject:
+        render_key = _as_uuid(render_id)
+        request_data = _dump(data)
+        self._validate_idempotency_key(idempotency_key)
+        reason = request_data.get("reason")
+        operation = "cancel_render"
+        request_hash = _request_hash(
+            {"operation": operation, "render_id": render_key, "reason": reason}
+        )
+        with self.database.transaction() as conn:
+            replay = self._get_idempotent_mutation(
+                conn, idempotency_key, operation, render_key, request_hash
+            )
+            if replay is not None:
+                return replay
+            row = self._get_row(conn, "render_jobs", render_key)
+            if row is None:
+                raise not_found("Render job")
+            current = _payload(row)
+            status = current["status"]
+            result = current
+            if status == RunStatus.RUNNING.value:
+                if current.get("cancel_requested_at") is None:
+                    now = _utc_now()
+                    result = {
+                        **current,
+                        "cancel_requested_at": now,
+                        "updated_at": now,
+                    }
+                    conn.execute(
+                        "UPDATE render_jobs SET cancel_requested_at = ?, cancel_reason = ?, updated_at = ?, "
+                        "payload = ? WHERE id = ? AND owner_user_id = ?",
+                        (now, reason, now, _json(result), render_key, self.owner_user_id),
+                    )
+            elif status == RunStatus.QUEUED.value:
+                now = _utc_now()
+                result = {
+                    **current,
+                    "status": RunStatus.CANCELLED.value,
+                    "output_ref": None,
+                    "error_message": None,
+                    "updated_at": now,
+                }
+                conn.execute(
+                    "UPDATE render_jobs SET status = ?, cancel_reason = ?, updated_at = ?, payload = ? "
+                    "WHERE id = ? AND owner_user_id = ?",
+                    (
+                        result["status"],
+                        reason,
+                        now,
+                        _json(result),
+                        render_key,
+                        self.owner_user_id,
+                    ),
+                )
+            elif status != RunStatus.CANCELLED.value:
+                raise conflict(
+                    "invalid_state_transition",
+                    "Only queued or running renders can be cancelled",
+                    current_status=status,
+                )
+            self._store_idempotent_mutation(
+                conn, idempotency_key, operation, render_key, request_hash, result
+            )
+        return result
+
+    def retry_render(self, render_id: UUID | str, idempotency_key: str) -> JsonObject:
+        render_key = _as_uuid(render_id)
+        self._validate_idempotency_key(idempotency_key)
+        operation = "retry_render"
+        request_hash = _request_hash({"operation": operation, "render_id": render_key})
+        with self.database.transaction() as conn:
+            replay = self._get_idempotent_mutation(
+                conn, idempotency_key, operation, render_key, request_hash
+            )
+            if replay is not None:
+                return replay
+            row = self._get_row(conn, "render_jobs", render_key)
+            if row is None:
+                raise not_found("Render job")
+            current = _payload(row)
+            if current["status"] != RunStatus.FAILED.value:
+                raise conflict(
+                    "invalid_state_transition",
+                    "Only a failed render can be retried",
+                    current_status=current["status"],
+                )
+            now = _utc_now()
+            next_attempt = current["attempt"] + 1
+            result = {
+                **current,
+                "status": RunStatus.QUEUED.value,
+                "attempt": next_attempt,
+                "cancel_requested_at": None,
+                "output_ref": None,
+                "error_message": None,
+                "updated_at": now,
+            }
+            conn.execute(
+                "UPDATE render_jobs SET status = ?, attempt = ?, cancel_requested_at = NULL, "
+                "cancel_reason = NULL, execution_claimed_at = NULL, "
+                "updated_at = ?, payload = ? WHERE id = ? AND owner_user_id = ? "
+                "AND status = 'failed'",
+                (
+                    result["status"],
+                    next_attempt,
+                    now,
+                    _json(result),
+                    render_key,
+                    self.owner_user_id,
+                ),
+            )
+            self._store_idempotent_mutation(
+                conn, idempotency_key, operation, render_key, request_hash, result
+            )
+        return result
+
+    def is_render_cancel_requested(self, render_id: UUID | str) -> bool:
+        return self.get_render(render_id).get("cancel_requested_at") is not None
+
+    def confirm_render_cancelled(self, render_id: UUID | str) -> JsonObject:
+        render_key = _as_uuid(render_id)
+        with self.database.transaction() as conn:
+            row = self._get_row(conn, "render_jobs", render_key)
+            if row is None:
+                raise not_found("Render job")
+            current = _payload(row)
+            if current["status"] == RunStatus.CANCELLED.value:
+                return current
+            if (
+                current["status"] != RunStatus.RUNNING.value
+                or current.get("cancel_requested_at") is None
+            ):
+                raise conflict(
+                    "invalid_state_transition",
+                    "Only a running render with a cancellation request can confirm cancellation",
+                )
+            now = _utc_now()
+            result = {
+                **current,
+                "status": RunStatus.CANCELLED.value,
+                "output_ref": None,
+                "error_message": None,
+                "updated_at": now,
+            }
+            conn.execute(
+                "UPDATE render_jobs SET status = ?, execution_claimed_at = NULL, "
+                "updated_at = ?, payload = ? "
+                "WHERE id = ? AND owner_user_id = ?",
+                (
+                    result["status"],
+                    now,
+                    _json(result),
+                    render_key,
+                    self.owner_user_id,
+                ),
+            )
+        return result
+
     def get_render_download_path(self, render_id: UUID | str) -> Path:
         """Resolve an owner-scoped completed MP4 beneath the configured artifact root."""
 
@@ -1294,13 +2208,14 @@ class DomainService:
         error_message: str | None = None,
     ) -> JsonObject:
         render_key = _as_uuid(render_id)
-        if status == RunStatus.SUCCEEDED.value and not output_ref:
+        requested_status = status
+        if requested_status == RunStatus.SUCCEEDED.value and not output_ref:
             raise DomainError(
                 422, "render_output_required", "A successful render requires output_ref"
             )
         stored_output_ref = (
             self._resolve_render_output(output_ref, require_exists=True)[1]
-            if status == RunStatus.SUCCEEDED.value and output_ref
+            if requested_status == RunStatus.SUCCEEDED.value and output_ref
             else None
         )
         with self.database.transaction() as conn:
@@ -1308,26 +2223,62 @@ class DomainService:
             if row is None:
                 raise not_found("Render job")
             current = _payload(row)
-            validate_render_transition(current["status"], status)
-            if current["status"] == status:
-                if status == RunStatus.SUCCEEDED.value and current.get("output_ref") == output_ref:
+            if current.get("cancel_requested_at") and requested_status != RunStatus.CANCELLED.value:
+                raise conflict(
+                    "invalid_state_transition",
+                    "A cancellation-requested render can only be confirmed as cancelled",
+                )
+            if (
+                requested_status == RunStatus.CANCELLED.value
+                and current["status"] == RunStatus.RUNNING.value
+                and current.get("cancel_requested_at") is None
+            ):
+                raise conflict(
+                    "invalid_state_transition",
+                    "A running render must have a cancellation request before cancellation",
+                )
+            target_status = requested_status
+            target_error = error_message
+            if requested_status in {
+                RunStatus.RUNNING.value,
+                RunStatus.SUCCEEDED.value,
+            }:
+                candidate = self._get(conn, "promotion_candidates", row["promotion_candidate_id"])
+                if candidate is None or candidate.get("eligibility_status") != MANUALLY_CONFIRMED:
+                    target_status = RunStatus.FAILED.value
+                    target_error = (
+                        "Promotion eligibility must be manually confirmed before rendering"
+                    )
+                    stored_output_ref = None
+            validate_render_transition(current["status"], target_status)
+            if current["status"] == target_status:
+                if target_status == RunStatus.SUCCEEDED.value and current.get("output_ref") == output_ref:
                     return current
-                if status == RunStatus.FAILED.value and current.get("error_message") == error_message:
+                if target_status == RunStatus.FAILED.value and current.get("error_message") == target_error:
                     return current
                 raise conflict("render_already_finished", "Render job is already in this state")
             now = _utc_now()
             updated = {
                 **current,
-                "status": status,
+                "status": target_status,
                 "output_ref": stored_output_ref,
-                "error_message": error_message if status == RunStatus.FAILED.value else None,
+                "error_message": target_error if target_status == RunStatus.FAILED.value else None,
+                "updated_at": now,
             }
             conn.execute(
-                "UPDATE render_jobs SET status = ?, updated_at = ?, payload = ? "
+                "UPDATE render_jobs SET status = ?, execution_claimed_at = ?, "
+                "updated_at = ?, payload = ? "
                 "WHERE id = ? AND owner_user_id = ?",
-                (status, now, _json(updated), render_key, self.owner_user_id),
+                (
+                    target_status,
+                    now if target_status == RunStatus.RUNNING.value else None,
+                    now,
+                    _json(updated),
+                    render_key,
+                    self.owner_user_id,
+                ),
             )
-            if status == RunStatus.SUCCEEDED.value:
+            if target_status == RunStatus.SUCCEEDED.value:
                 self._create_publication_package(conn, row, updated)
         return updated
 
@@ -1396,7 +2347,15 @@ class DomainService:
                     "publication_package_not_ready",
                     "A publication package is available after an approved render completes",
                 )
-            return _payload(row), row["render_id"]
+            render_row = self._get_row(conn, "render_jobs", row["render_id"])
+            if render_row is None:
+                raise conflict(
+                    "package_references_missing", "Package render is unavailable"
+                )
+            return (
+                self._refresh_publication_checklist(conn, _payload(row), render_row),
+                row["render_id"],
+            )
 
     def save_publication_package(
         self,
@@ -1571,6 +2530,26 @@ class DomainService:
                 )
         return item
 
+    def _refresh_publication_checklist(
+        self, conn: Any, package: JsonObject, render_row: Any
+    ) -> JsonObject:
+        project = self._get(conn, "creative_projects", package["project_id"])
+        candidate = self._get(
+            conn, "promotion_candidates", package["promotion_candidate_id"]
+        )
+        if project is None or candidate is None:
+            raise conflict("package_references_missing", "Package references are unavailable")
+        rights = json.loads(render_row["asset_rights"])
+        checklist = {
+            "account_eligible": False,
+            "product_eligible": candidate.get("eligibility_status") == MANUALLY_CONFIRMED,
+            "edition_matches": candidate.get("book_id") == project.get("book_id"),
+            "rights_confirmed": bool(rights)
+            and all(item.get("usage_status") == "allowed" for item in rights),
+            "manual_attachment_required": True,
+        }
+        return {**package, "checklist": checklist, "publication_state": "needs_manual_checks"}
+
     def _create_publication_package(
         self, conn: Any, render_row: Any, render: JsonObject
     ) -> JsonObject:
@@ -1680,8 +2659,9 @@ class DomainService:
         render_id: str | None = None,
         reason_code: str | None = None,
         message: str | None = None,
+        attempt: int | None = None,
     ) -> JsonObject:
-        return {
+        event = {
             "event_id": str(uuid4()),
             "run_id": run["id"],
             "project_id": run["project_id"],
@@ -1695,6 +2675,9 @@ class DomainService:
             "reason_code": reason_code,
             "message": message,
         }
+        if attempt is not None:
+            event["attempt"] = attempt
+        return event
 
     def _insert_event(self, conn: Any, event: JsonObject) -> None:
         conn.execute(
@@ -1721,7 +2704,9 @@ class DomainService:
         }.get(status, RunEventType.STAGE_CHANGED.value)
 
     @staticmethod
-    def _validate_event_type(event_type: str, status: str) -> None:
+    def _validate_event_type(
+        event_type: str, status: str, attempt: int | None = None
+    ) -> None:
         try:
             parsed = RunEventType(event_type)
         except ValueError as exc:
@@ -1730,13 +2715,28 @@ class DomainService:
             RunEventType.REVIEW_REQUESTED: RunStatus.WAITING_REVIEW.value,
             RunEventType.FAILED: RunStatus.FAILED.value,
             RunEventType.COMPLETED: RunStatus.SUCCEEDED.value,
+            RunEventType.CANCEL_REQUESTED: RunStatus.RUNNING.value,
             RunEventType.CANCELLED: RunStatus.CANCELLED.value,
+            RunEventType.RETRY_REQUESTED: RunStatus.QUEUED.value,
         }.get(parsed)
         if required_status and status != required_status:
             raise conflict(
                 "event_status_mismatch",
                 f"{event_type} requires status {required_status}",
             )
+        if parsed in {RunEventType.CANCEL_REQUESTED, RunEventType.RETRY_REQUESTED}:
+            if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
+                raise DomainError(
+                    422,
+                    "invalid_run_event",
+                    f"{event_type} requires a positive attempt number",
+                )
+            if parsed == RunEventType.RETRY_REQUESTED and attempt < 2:
+                raise DomainError(
+                    422,
+                    "invalid_run_event",
+                    "run.retry_requested requires attempt 2 or greater",
+                )
 
     @staticmethod
     def _validate_idempotency_key(key: str) -> None:
@@ -1747,7 +2747,70 @@ class DomainService:
                 "Idempotency-Key length must be between 8 and 128 characters",
             )
 
+    def _get_idempotent_mutation(
+        self,
+        conn: Any,
+        key: str,
+        operation: str,
+        resource_id: str,
+        request_hash: str,
+    ) -> JsonObject | None:
+        row = conn.execute(
+            "SELECT operation, resource_id, request_hash, response_payload "
+            "FROM idempotency_operations WHERE owner_user_id = ? AND idempotency_key = ?",
+            (self.owner_user_id, key),
+        ).fetchone()
+        if row is None:
+            return None
+        if (
+            row["operation"] != operation
+            or row["resource_id"] != resource_id
+            or row["request_hash"] != request_hash
+        ):
+            raise conflict(
+                "idempotency_key_conflict",
+                "Idempotency-Key was already used with a different request",
+            )
+        return json.loads(row["response_payload"])
+
+    def _store_idempotent_mutation(
+        self,
+        conn: Any,
+        key: str,
+        operation: str,
+        resource_id: str,
+        request_hash: str,
+        response: JsonObject,
+    ) -> None:
+        conn.execute(
+            "INSERT INTO idempotency_operations"
+            "(owner_user_id, idempotency_key, operation, resource_id, request_hash, "
+            "response_payload, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                self.owner_user_id,
+                key,
+                operation,
+                resource_id,
+                request_hash,
+                _json(response),
+                _utc_now(),
+            ),
+        )
+
     @staticmethod
     def _validate_queue_limit(limit: int) -> None:
         if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 500:
             raise DomainError(422, "invalid_limit", "Queue limit must be between 1 and 500")
+
+    @staticmethod
+    def _validate_run_lease(lease_seconds: int) -> None:
+        if (
+            not isinstance(lease_seconds, int)
+            or isinstance(lease_seconds, bool)
+            or not 1 <= lease_seconds <= 3600
+        ):
+            raise DomainError(
+                422,
+                "invalid_lease",
+                "Execution lease must be between 1 and 3600 seconds",
+            )

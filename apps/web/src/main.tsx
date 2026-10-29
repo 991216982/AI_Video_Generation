@@ -7,10 +7,13 @@ import {
   DEFAULT_API_BASE_URL,
 } from "./api";
 import type {
+  BookPage,
   BookCreate,
   BookEdition,
   CreativeProject,
   CreativeProjectCreate,
+  CreativeProjectPage,
+  CreativeWorkspace,
   Evidence,
   EvidenceCreate,
   Platform,
@@ -29,6 +32,7 @@ import "./styles.css";
 
 type Mode = "demo" | "api";
 type Step = "source" | "brief" | "script" | "review" | "package";
+type LibraryTab = "projects" | "books";
 
 interface BookDraft {
   title: string;
@@ -122,6 +126,22 @@ function makeId(): string {
   return globalThis.crypto?.randomUUID?.() ?? `demo-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
+function savedPreference(key: string, fallback: string): string {
+  try {
+    return window.localStorage.getItem(key) ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function savePreference(key: string, value: string): void {
+  try {
+    window.localStorage.setItem(key, value);
+  } catch {
+    // The API remains usable when browser storage is disabled.
+  }
+}
+
 function nowIso(): string {
   return new Date().toISOString();
 }
@@ -193,6 +213,7 @@ function makeEvent(run: Run, sequence: number, type: RunEvent["type"], message: 
     status: run.status,
     stage: run.stage,
     occurred_at: nowIso(),
+    attempt: run.attempt,
     script_version_id: null,
     render_id: null,
     reason_code: null,
@@ -276,20 +297,38 @@ function demoScriptVersions(project: CreativeProject, book: BookEdition, angle: 
 }
 
 function App() {
-  const [mode, setMode] = useState<Mode>("demo");
+  const [mode, setMode] = useState<Mode>(() => savedPreference("book-video.mode", "demo") === "api" ? "api" : "demo");
   const [activeStep, setActiveStep] = useState<Step>("source");
-  const [apiBaseUrl, setApiBaseUrl] = useState(DEFAULT_API_BASE_URL);
+  const [apiBaseUrl, setApiBaseUrl] = useState(() => savedPreference("book-video.apiBaseUrl", DEFAULT_API_BASE_URL));
   const api = useMemo(() => new BookVideoApi(apiBaseUrl), [apiBaseUrl]);
+  const [navigatorOpen, setNavigatorOpen] = useState(true);
+  const [navigatorTab, setNavigatorTab] = useState<LibraryTab>("projects");
+  const [navigatorSearch, setNavigatorSearch] = useState("");
+  const [libraryBooks, setLibraryBooks] = useState<BookEdition[]>([]);
+  const [libraryBookMap, setLibraryBookMap] = useState<Record<string, BookEdition>>({});
+  const [libraryProjects, setLibraryProjects] = useState<CreativeProject[]>([]);
+  const [bookNextCursor, setBookNextCursor] = useState<string | null>(null);
+  const [projectNextCursor, setProjectNextCursor] = useState<string | null>(null);
+  const [bookCursorHistory, setBookCursorHistory] = useState<(string | null)[]>([]);
+  const [projectCursorHistory, setProjectCursorHistory] = useState<(string | null)[]>([]);
+  const [bookCursor, setBookCursor] = useState<string | null>(null);
+  const [projectCursor, setProjectCursor] = useState<string | null>(null);
+  const [libraryLoading, setLibraryLoading] = useState(false);
+  const [libraryReloadKey, setLibraryReloadKey] = useState(0);
+  const [apiReachable, setApiReachable] = useState<boolean | null>(null);
   const [isSampleLoaded, setIsSampleLoaded] = useState(false);
   const [bookDraft, setBookDraft] = useState<BookDraft>(EMPTY_BOOK);
   const [candidateDraft, setCandidateDraft] = useState<CandidateDraft>(EMPTY_CANDIDATE);
   const [evidenceDraft, setEvidenceDraft] = useState<EvidenceDraft>(EMPTY_EVIDENCE);
   const [briefDraft, setBriefDraft] = useState<BriefDraft>(EMPTY_BRIEF);
-  const [manualCandidateConfirmation, setManualCandidateConfirmation] = useState(false);
+  const [eligibilityAttestation, setEligibilityAttestation] = useState(false);
+  const [eligibilityNote, setEligibilityNote] = useState("");
+  const [cancelReason, setCancelReason] = useState("");
 
   const [book, setBook] = useState<BookEdition | null>(null);
   const [candidate, setCandidate] = useState<PromotionCandidate | null>(null);
   const [evidence, setEvidence] = useState<Evidence | null>(null);
+  const [workspaceEvidence, setWorkspaceEvidence] = useState<Evidence[]>([]);
   const [project, setProject] = useState<CreativeProject | null>(null);
   const [versions, setVersions] = useState<ScriptVersion[]>([]);
   const [selectedVersionId, setSelectedVersionId] = useState("");
@@ -314,6 +353,50 @@ function App() {
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
 
+  useEffect(() => savePreference("book-video.mode", mode), [mode]);
+  useEffect(() => savePreference("book-video.apiBaseUrl", apiBaseUrl), [apiBaseUrl]);
+
+  useEffect(() => {
+    if (mode !== "api" || !navigatorOpen) return;
+    let active = true;
+    setLibraryLoading(true);
+    const timer = window.setTimeout(() => {
+      const load = async () => {
+        try {
+          if (navigatorTab === "books") {
+            const page: BookPage = await api.listBooks({ limit: 20, cursor: bookCursor, q: navigatorSearch });
+            if (!active) return;
+            setLibraryBooks(page.items);
+            setBookNextCursor(page.next_cursor);
+          } else {
+            const [projectPage, bookPage]: [CreativeProjectPage, BookPage] = await Promise.all([
+              api.listCreativeProjects({ limit: 20, cursor: projectCursor }),
+              api.listBooks({ limit: 100, q: navigatorSearch }),
+            ]);
+            if (!active) return;
+            setLibraryProjects(projectPage.items);
+            setProjectNextCursor(projectPage.next_cursor);
+            setLibraryBookMap(Object.fromEntries(bookPage.items.map((item) => [item.id, item])));
+          }
+          setApiReachable(true);
+          setError("");
+        } catch (requestError) {
+          if (active) {
+            setApiReachable(false);
+            setError(errorMessage(requestError));
+          }
+        } finally {
+          if (active) setLibraryLoading(false);
+        }
+      };
+      void load();
+    }, 200);
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+    };
+  }, [api, mode, navigatorOpen, navigatorTab, navigatorSearch, bookCursor, projectCursor, libraryReloadKey]);
+
   useEffect(() => {
     if (!selectedVersion) return;
     setEditorTitle(selectedVersion.title_suggestion);
@@ -332,18 +415,29 @@ function App() {
     const stream = api.subscribeToRunEvents(
       runId,
       (event) => {
+        if (event.script_version_id) setSelectedVersionId(event.script_version_id);
         setEvents((existing) => {
           if (existing.some((item) => item.run_id === event.run_id && item.sequence === event.sequence)) return existing;
           return [...existing, event].sort((left, right) => left.sequence - right.sequence);
         });
         setRun((current) => {
           if (!current || current.id !== event.run_id || event.sequence < current.sequence) return current;
-          return { ...current, status: event.status, stage: event.stage, sequence: event.sequence, updated_at: event.occurred_at };
+          return {
+            ...current,
+            status: event.status,
+            stage: event.stage,
+            sequence: event.sequence,
+            attempt: event.attempt ?? current.attempt,
+            cancel_requested_at: event.type === "run.cancel_requested" ? event.occurred_at : current.cancel_requested_at,
+            error_code: event.type === "run.failed" ? event.reason_code : current.error_code,
+            error_message: event.type === "run.failed" ? event.message ?? "任务执行失败" : current.error_message,
+            updated_at: event.occurred_at,
+          };
         });
       },
       () => setRunStreamWarning("实时事件暂不可用，页面会继续轮询任务状态。"),
     );
-    const timer = window.setInterval(async () => {
+    const timer = ["queued", "running"].includes(run.status) ? window.setInterval(async () => {
       try {
         const latest = await api.getRun(runId);
         setRun(latest);
@@ -351,10 +445,10 @@ function App() {
       } catch (requestError) {
         setError(errorMessage(requestError));
       }
-    }, 3000);
+    }, 3000) : null;
     return () => {
       stream.close();
-      window.clearInterval(timer);
+      if (timer !== null) window.clearInterval(timer);
     };
   }, [api, mode, run?.id, run?.status, project?.id]);
 
@@ -387,10 +481,10 @@ function App() {
     setCandidateDraft(EMPTY_CANDIDATE);
     setEvidenceDraft(EMPTY_EVIDENCE);
     setBriefDraft(EMPTY_BRIEF);
-    setManualCandidateConfirmation(false);
     setBook(null);
     setCandidate(null);
     setEvidence(null);
+    setWorkspaceEvidence([]);
     setProject(null);
     setVersions([]);
     setSelectedVersionId("");
@@ -407,6 +501,9 @@ function App() {
     setRenderJob(null);
     setPublicationPackage(null);
     setPackagePreviewShown(false);
+    setEligibilityAttestation(false);
+    setEligibilityNote("");
+    setCancelReason("");
     setIsSampleLoaded(false);
     setActiveStep("source");
     setError("");
@@ -417,8 +514,96 @@ function App() {
     if (nextMode === mode) return;
     if (isSampleLoaded || book || candidate || project) clearSession();
     setMode(nextMode);
+    setNavigatorOpen(nextMode === "api");
+    setApiReachable(null);
     setError("");
     setSuccess(nextMode === "api" ? "已切换到 API 模式。保存操作将发送至当前 API 基址。" : "已切换到本地演示模式。演示数据不会发送到 API。");
+  }
+
+  async function openWorkspace(projectId: string) {
+    setBusy("workspace");
+    setError("");
+    try {
+      const workspace: CreativeWorkspace = await api.getCreativeWorkspace(projectId);
+      const orderedVersions = [...workspace.script_versions].sort((left, right) => left.version_number - right.version_number);
+      const latestRun = [...workspace.runs].sort((left, right) => Date.parse(right.updated_at) - Date.parse(left.updated_at))[0] ?? null;
+      const latestRender = [...workspace.render_jobs].sort((left, right) => Date.parse(right.updated_at) - Date.parse(left.updated_at))[0] ?? null;
+      const pendingVersion = [...orderedVersions].reverse().find((version) => version.review_status === "pending");
+      const selected = latestRun?.status === "waiting_review"
+        ? pendingVersion ?? orderedVersions.at(-1)
+        : latestRender
+          ? orderedVersions.find((version) => version.id === latestRender.script_version_id) ?? orderedVersions.at(-1)
+          : orderedVersions.at(-1);
+
+      setBook(workspace.book);
+      setCandidate(workspace.promotion_candidate);
+      setEvidence(workspace.evidence[0] ?? null);
+      setWorkspaceEvidence(workspace.evidence);
+      setProject(workspace.project);
+      setVersions(orderedVersions);
+      setSelectedVersionId(selected?.id ?? "");
+      setRun(latestRun);
+      setEvents([]);
+      setRunStreamWarning("");
+      setRenderJob(latestRender);
+      setPublicationPackage(workspace.publication_package);
+      setPackagePreviewShown(false);
+      setBookDraft({
+        title: workspace.book.title,
+        editionLabel: workspace.book.edition_label,
+        author: workspace.book.author,
+        isbn: workspace.book.isbn ?? "",
+        publisher: workspace.book.publisher ?? "",
+        originalOpinion: workspace.book.original_opinion,
+        factKey: workspace.book.facts[0]?.key ?? "",
+        factValue: workspace.book.facts[0]?.value ?? "",
+        factStatus: workspace.book.facts[0]?.verification_status ?? "unverified",
+        factSourceNote: workspace.book.facts[0]?.source_note ?? "",
+      });
+      setCandidateDraft({
+        platform: workspace.promotion_candidate.platform,
+        productId: workspace.promotion_candidate.platform_product_id,
+        productUrl: workspace.promotion_candidate.product_url,
+        eligibilityNote: workspace.promotion_candidate.eligibility_note ?? "",
+      });
+      setEligibilityNote(workspace.promotion_candidate.eligibility_note ?? "");
+      setEligibilityAttestation(false);
+      setEvidenceDraft(workspace.evidence[0] ? {
+        sourceNote: workspace.evidence[0].source_note,
+        sourceUrl: workspace.evidence[0].source_url ?? "",
+        usageBasis: workspace.evidence[0].usage_basis,
+        metricName: workspace.evidence[0].metric_name ?? "",
+        metricValue: workspace.evidence[0].metric_value === null ? "" : String(workspace.evidence[0].metric_value),
+        observedAt: workspace.evidence[0].observed_at.slice(0, 10),
+        windowStart: workspace.evidence[0].metric_window_start?.slice(0, 10) ?? "",
+        windowEnd: workspace.evidence[0].metric_window_end?.slice(0, 10) ?? "",
+        missingReason: workspace.evidence[0].missing_reason ?? "",
+      } : EMPTY_EVIDENCE);
+      setBriefDraft({
+        audience: workspace.project.target_audience,
+        platform: workspace.project.target_platform,
+        seconds: workspace.project.desired_seconds,
+        angle: workspace.project.original_angle,
+        prohibitedClaims: workspace.project.prohibited_claims.join("，"),
+      });
+      setReviewDecision("approve");
+      setReviewNote("");
+      setReviewFlags({ fact: false, product: false, rights: false });
+      setRenderRightsConfirmed(false);
+      setActiveStep(latestRun?.status === "waiting_review" ? "review" : latestRender?.status === "succeeded" && workspace.publication_package ? "package" : orderedVersions.length ? "script" : "brief");
+      setNavigatorOpen(false);
+      setApiReachable(true);
+      setSuccess("已从 API 恢复历史项目，包括精确图书版次、脚本版本、任务、渲染和发布包状态。审核勾选需要你重新确认。");
+    } catch (requestError) {
+      setApiReachable(false);
+      setError(errorMessage(requestError));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function refreshCurrentWorkspace() {
+    if (project?.id) await openWorkspace(project.id);
   }
 
   function loadContractSample() {
@@ -496,10 +681,12 @@ function App() {
       setCandidate(null);
       setProject(null);
       setEvidence(null);
+      setWorkspaceEvidence([]);
       setVersions([]);
       setRun(null);
       setPublicationPackage(null);
       setSuccess(mode === "api" ? "图书版本已由 API 保存。" : "图书版本已保存在本地演示状态。未向后端发送数据。");
+      if (mode === "api") setLibraryReloadKey((value) => value + 1);
     } catch (requestError) {
       setError(errorMessage(requestError));
     } finally {
@@ -513,21 +700,21 @@ function App() {
     setBusy("candidate");
     setError("");
     try {
-      const confirmed = mode === "api" && manualCandidateConfirmation;
       const payload: PromotionCandidateCreate = {
         book_id: book.id,
         platform: candidateDraft.platform,
         platform_product_id: candidateDraft.productId.trim(),
         product_url: candidateDraft.productUrl.trim(),
-        eligibility_status: confirmed ? "manually_confirmed" : "unverified",
-        eligibility_checked_at: confirmed ? nowIso() : null,
-        eligibility_note: candidateDraft.eligibilityNote.trim()
-          || (confirmed ? "创作者在平台客户端手动核对；非平台自动验证。" : null),
+        eligibility_status: "unverified",
+        eligibility_checked_at: null,
+        eligibility_note: candidateDraft.eligibilityNote.trim() || null,
       };
       const created: PromotionCandidate = mode === "api"
         ? await api.createPromotionCandidate(payload)
-        : { ...payload, eligibility_status: "unverified", eligibility_checked_at: null, id: makeId(), owner_user_id: makeId(), created_at: nowIso() };
+        : { ...payload, eligibility_status: "unverified", eligibility_checked_at: null, eligibility_revision: 1, eligibility_checked_by_user_id: null, id: makeId(), owner_user_id: makeId(), created_at: nowIso() };
       setCandidate(created);
+      setEligibilityNote(created.eligibility_note ?? "");
+      setEligibilityAttestation(false);
       setProject(null);
       setVersions([]);
       setRun(null);
@@ -535,6 +722,111 @@ function App() {
       setSuccess(mode === "api"
         ? "拟挂商品已保存。平台资格仍以创作者本人在平台客户端核对为准。"
         : "虚构拟挂商品已保存在本地演示状态，资格保持未核实。");
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function updateEligibility(nextStatus: "unverified" | "manually_confirmed") {
+    if (mode !== "api" || !candidate) return;
+    const note = eligibilityNote.trim();
+    if (nextStatus === "manually_confirmed" && (!eligibilityAttestation || !note)) {
+      setError("请先确认你已在本人平台账号后台核对，并填写核对说明。该记录不会验证平台资格。");
+      return;
+    }
+    setBusy("eligibility");
+    setError("");
+    try {
+      const updated = await api.updatePromotionEligibility(candidate.id, {
+        eligibility_status: nextStatus,
+        expected_revision: candidate.eligibility_revision,
+        eligibility_note: nextStatus === "manually_confirmed" ? note : null,
+        confirmation_basis: nextStatus === "manually_confirmed" ? "creator_account_backend" : null,
+      });
+      setCandidate(updated);
+      setCandidateDraft((draft) => ({ ...draft, eligibilityNote: updated.eligibility_note ?? "" }));
+      setEligibilityNote(updated.eligibility_note ?? "");
+      setEligibilityAttestation(false);
+      if (project && publicationPackage) {
+        const refreshed = await api.getCreativeWorkspace(project.id);
+        setPublicationPackage(refreshed.publication_package);
+      }
+      setSuccess(nextStatus === "manually_confirmed"
+        ? `已保存第 ${updated.eligibility_revision} 版人工核对记录。它不代表平台认证或系统自动验证。`
+        : `已撤回资格记录（第 ${updated.eligibility_revision} 版）；后续审核和核对卡将按当前状态重新计算。`);
+    } catch (requestError) {
+      const conflict = requestError instanceof ApiRequestError && requestError.code === "revision_conflict";
+      const currentRevision = conflict ? requestError.details?.current_revision : undefined;
+      const detail = conflict
+        ? `资格记录已被更新：你提交的是第 ${candidate.eligibility_revision} 版${typeof currentRevision === "number" ? `，服务端当前为第 ${currentRevision} 版` : ""}。请刷新当前工作区后再操作。`
+        : "";
+      setError([errorMessage(requestError), detail].filter(Boolean).join(" "));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function cancelCurrentRun() {
+    if (!run || mode !== "api") return;
+    setBusy("cancel-run");
+    setError("");
+    try {
+      const updated = await api.cancelRun(run.id, { reason: cancelReason.trim() || null });
+      setRun(updated);
+      setSuccess(updated.cancel_requested_at
+        ? "已向 API 请求取消。执行中的任务会在 worker 确认停止后标记为已取消。"
+        : "任务已取消。");
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function retryCurrentRun() {
+    if (!run || mode !== "api") return;
+    setBusy("retry-run");
+    setError("");
+    try {
+      const updated = await api.retryRun(run.id);
+      setRun(updated);
+      setEvents([]);
+      setSuccess(`已请求重试第 ${updated.attempt} 轮；任务沿用原始输入和同一 run ID。`);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function cancelCurrentRender() {
+    if (!renderJob || mode !== "api") return;
+    setBusy("cancel-render");
+    setError("");
+    try {
+      const updated = await api.cancelRender(renderJob.id, { reason: cancelReason.trim() || null });
+      setRenderJob(updated);
+      setSuccess(updated.cancel_requested_at
+        ? "已向 API 请求取消渲染；worker 确认停止前，状态可能仍显示处理中。"
+        : "渲染任务已取消。");
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function retryCurrentRender() {
+    if (!renderJob || mode !== "api") return;
+    setBusy("retry-render");
+    setError("");
+    try {
+      const updated = await api.retryRender(renderJob.id);
+      setRenderJob(updated);
+      setPublicationPackage(null);
+      setSuccess(`已请求重试第 ${updated.attempt} 轮渲染；任务沿用原始审核输入和同一 render ID。`);
     } catch (requestError) {
       setError(errorMessage(requestError));
     } finally {
@@ -569,6 +861,7 @@ function App() {
         ? await api.createEvidence(payload)
         : { ...payload, id: makeId(), owner_user_id: makeId(), collected_at: nowIso() };
       setEvidence(created);
+      setWorkspaceEvidence((existing) => [...existing, created]);
       setSuccess(mode === "api" ? "人工证据来源已保存。" : "虚构人工证据已保存在本地演示状态。");
     } catch (requestError) {
       setError(errorMessage(requestError));
@@ -601,6 +894,7 @@ function App() {
       setRun(null);
       setEvents([]);
       setPublicationPackage(null);
+      if (mode === "api") setLibraryReloadKey((value) => value + 1);
       setSuccess(mode === "api" ? "创作 Brief 已保存。" : "创作 Brief 已保存在本地演示状态。");
       setActiveStep("script");
     } catch (requestError) {
@@ -630,6 +924,8 @@ function App() {
           status: "waiting_review",
           stage: "review",
           sequence: 2,
+          attempt: 1,
+          cancel_requested_at: null,
           error_code: null,
           error_message: null,
           created_at: nowIso(),
@@ -702,7 +998,9 @@ function App() {
       "run.reviewed": "审核记录",
       "run.failed": "任务失败",
       "run.completed": "任务完成",
+      "run.cancel_requested": "已请求取消",
       "run.cancelled": "任务取消",
+      "run.retry_requested": "已请求重试",
     };
     return labels[event.type];
   }
@@ -713,7 +1011,7 @@ function App() {
     const candidateIsManuallyConfirmed = candidate?.eligibility_status === "manually_confirmed";
     const factsHaveSources = Boolean(book?.facts.length && book.facts.every((fact) => fact.verification_status !== "unverified"));
     if (reviewDecision === "approve" && (!reviewFlags.fact || !reviewFlags.product || !reviewFlags.rights || !factsHaveSources || !candidateIsManuallyConfirmed)) {
-      setError("暂不能提交通过：请先核对书籍事实、商品版本与素材权利，并在 API 保存拟挂商品时记录本人已在平台客户端完成的人工核对。示例商品资格未核实。 ");
+      setError("暂不能提交通过：请先核对书籍事实、商品版本与素材权利，并在“选书与商品”的资格记录面板中通过 API 保存本人已完成的人工核对。演示商品资格始终未核实。 ");
       return;
     }
     setBusy("review");
@@ -871,6 +1169,14 @@ function App() {
   const canApprove = reviewFlagsComplete && factsHaveSources && candidateIsManuallyConfirmed;
   const approvedVersion = versions.find((version) => version.review_status === "approved") ?? null;
   const selectedVersionApproved = selectedVersion?.review_status === "approved";
+  const filteredLibraryProjects = libraryProjects.filter((item) => {
+    const query = navigatorSearch.trim().toLocaleLowerCase();
+    if (!query) return true;
+    const relatedBook = libraryBookMap[item.book_id];
+    return [item.id, item.target_audience, item.original_angle, relatedBook?.title, relatedBook?.author, relatedBook?.isbn]
+      .some((value) => value?.toLocaleLowerCase().includes(query));
+  });
+  const primaryEvidence = workspaceEvidence[0] ?? evidence;
 
   return (
     <div className="app-shell">
@@ -922,6 +1228,7 @@ function App() {
               <button className={mode === "demo" ? "selected" : ""} onClick={() => changeMode("demo")} type="button">演示</button>
               <button className={mode === "api" ? "selected" : ""} onClick={() => changeMode("api")} type="button">API</button>
             </label>
+            {mode === "api" && <button className="library-toggle" onClick={() => setNavigatorOpen((open) => !open)} type="button">{navigatorOpen ? "收起历史项目" : "历史项目"}</button>}
             <div className="avatar" aria-label="本人工作区">我</div>
           </div>
         </header>
@@ -945,8 +1252,49 @@ function App() {
             </div>
           )}
 
-          {error && <div className="notice notice-error" role="alert"><span>!</span><div><strong>操作未完成</strong><p>{error}</p></div><button aria-label="关闭错误提示" onClick={() => setError("")} type="button">×</button></div>}
+          {error && <div className="notice notice-error" role="alert"><span>!</span><div><strong>操作未完成</strong><p>{error}</p>{error.includes("资格记录已被更新") && project && <button className="text-button" disabled={busy === "workspace"} onClick={() => void refreshCurrentWorkspace()} type="button">刷新当前工作区 <span>↻</span></button>}</div><button aria-label="关闭错误提示" onClick={() => setError("")} type="button">×</button></div>}
           {success && <div className="notice notice-success" role="status"><span>✓</span><p>{success}</p><button aria-label="关闭提示" onClick={() => setSuccess("")} type="button">×</button></div>}
+
+          {mode === "api" && navigatorOpen && (
+            <section className="library-card" aria-label="API 历史工作区">
+              <div className="library-heading">
+                <div><span className="eyebrow">API WORKSPACE</span><h2>历史图书与项目</h2><p>从服务端重新读取记录；刷新页面后可继续当前项目。</p></div>
+                <button className="button button-muted" disabled={libraryLoading} onClick={() => setLibraryReloadKey((value) => value + 1)} type="button">{libraryLoading ? "读取中…" : "刷新列表"}<span>↻</span></button>
+              </div>
+              <div className="library-tools">
+                <div className="library-tabs" role="tablist" aria-label="历史记录类型">
+                  <button aria-selected={navigatorTab === "projects"} className={navigatorTab === "projects" ? "active" : ""} onClick={() => setNavigatorTab("projects")} role="tab" type="button">创作项目</button>
+                  <button aria-selected={navigatorTab === "books"} className={navigatorTab === "books" ? "active" : ""} onClick={() => setNavigatorTab("books")} role="tab" type="button">图书版本</button>
+                </div>
+                <label className="library-search"><span>{navigatorTab === "books" ? "搜索书名、作者或 ISBN" : "搜索图书、受众、原创角度或项目 ID"}</span><input onChange={(event) => { setNavigatorSearch(event.target.value); setBookCursor(null); setBookCursorHistory([]); setProjectCursor(null); setProjectCursorHistory([]); }} placeholder="输入关键词" value={navigatorSearch} /></label>
+              </div>
+              {apiReachable === false && (
+                <div className="library-offline" role="status"><span>!</span><div><strong>API 暂不可用</strong><p>请检查 API 基址、服务状态与浏览器跨域设置，然后刷新列表。当前工作区没有从本地缓存恢复。</p></div><button className="button button-secondary" onClick={() => setLibraryReloadKey((value) => value + 1)} type="button">重试连接</button></div>
+              )}
+              {navigatorTab === "projects" ? (
+                <>
+                  {filteredLibraryProjects.length === 0 && !libraryLoading
+                    ? <EmptyState icon="▤" title={navigatorSearch ? "当前页没有匹配项目" : "还没有历史项目"} body={navigatorSearch ? "搜索覆盖当前项目页；可以翻页继续查找，或搜索图书记录。" : "创建创作 Brief 后，项目会出现在这里；重新加载页面也能从 API 找回。"} />
+                    : <div className="library-list">{filteredLibraryProjects.map((item) => {
+                      const relatedBook = libraryBookMap[item.book_id];
+                      return <article className="library-row" key={item.id}>
+                        <span className="library-row-icon">▤</span><div><strong>{relatedBook ? `${relatedBook.title} · ${relatedBook.edition_label}` : `项目 ${shortId(item.id)}`}</strong><p>{platformName(item.target_platform)} · {item.target_audience} · {item.desired_seconds} 秒</p><small>{item.original_angle}</small></div><button className="button button-secondary" disabled={busy === "workspace"} onClick={() => void openWorkspace(item.id)} type="button">{busy === "workspace" && project?.id === item.id ? "读取中…" : "继续项目"}<span>→</span></button>
+                      </article>;
+                    })}</div>}
+                  <div className="library-pagination"><button className="button button-muted" disabled={!projectCursorHistory.length || libraryLoading} onClick={() => { const prior = [...projectCursorHistory]; const cursor = prior.pop() ?? null; setProjectCursorHistory(prior); setProjectCursor(cursor); }} type="button">← 上一页</button><span>第 {projectCursorHistory.length + 1} 页 · 最多 20 条</span><button className="button button-muted" disabled={!projectNextCursor || libraryLoading} onClick={() => { setProjectCursorHistory((history) => [...history, projectCursor]); setProjectCursor(projectNextCursor); }} type="button">下一页 →</button></div>
+                </>
+              ) : (
+                <>
+                  {libraryBooks.length === 0 && !libraryLoading
+                    ? <EmptyState icon="▤" title={navigatorSearch ? "没有匹配的图书版本" : "还没有图书记录"} body="图书列表来自 API。书名相同但版次不同的记录会分开保留。" />
+                    : <div className="library-list">{libraryBooks.map((item) => <article className="library-row" key={item.id}>
+                      <span className="library-row-icon">▤</span><div><strong>{item.title} · {item.edition_label}</strong><p>{item.author}{item.publisher ? ` · ${item.publisher}` : ""}</p><small>{item.isbn ? `ISBN ${item.isbn}` : "未录入 ISBN"} · 创建于 {formatTime(item.created_at)}</small></div><span className="library-record-id">{shortId(item.id)}</span>
+                    </article>)}</div>}
+                  <div className="library-pagination"><button className="button button-muted" disabled={!bookCursorHistory.length || libraryLoading} onClick={() => { const prior = [...bookCursorHistory]; const cursor = prior.pop() ?? null; setBookCursorHistory(prior); setBookCursor(cursor); }} type="button">← 上一页</button><span>第 {bookCursorHistory.length + 1} 页 · 最多 20 条</span><button className="button button-muted" disabled={!bookNextCursor || libraryLoading} onClick={() => { setBookCursorHistory((history) => [...history, bookCursor]); setBookCursor(bookNextCursor); }} type="button">下一页 →</button></div>
+                </>
+              )}
+            </section>
+          )}
 
           <section className="welcome-row">
             <div>
@@ -996,16 +1344,21 @@ function App() {
                   <div className="section-divider" />
                   <div className="form-section-title"><span className="section-index">B</span><div><h2>拟挂商品</h2><p>记录商品链接与平台，资格状态默认未核实。</p></div>{candidate && <span className={`status-pill ${candidate.eligibility_status === "manually_confirmed" ? "status-verified" : "status-pending"}`}>{candidate.eligibility_status === "manually_confirmed" ? "本人记录已核对" : "未核实"}</span>}</div>
                   {candidate && <div className="saved-record candidate-record"><span className="saved-icon">◇</span><div><strong>{candidate.platform_product_id}</strong><p>{platformName(candidate.platform)} · {candidate.eligibility_note || "没有核验说明"}</p></div><small>{candidate.eligibility_status === "manually_confirmed" ? "人工记录" : "待人工核对"}</small></div>}
+                  {candidate && mode === "api" && (
+                    <div className="eligibility-panel">
+                      <div className="eligibility-panel-heading"><div><strong>商品资格人工记录</strong><small>修订号 {candidate.eligibility_revision} · 最近核对 {formatTime(candidate.eligibility_checked_at ?? undefined)}</small></div><span className={`status-pill ${candidate.eligibility_status === "manually_confirmed" ? "status-verified" : "status-pending"}`}>{candidate.eligibility_status === "manually_confirmed" ? "本人记录已核对" : "未核实"}</span></div>
+                      <Field label="核对说明"><textarea maxLength={500} onChange={(event) => setEligibilityNote(event.target.value)} placeholder="只记录你本人在自己的平台账号后台核对的范围和结果" rows={2} value={eligibilityNote} /></Field>
+                      {candidate.eligibility_status !== "manually_confirmed" && <label className="eligibility-attestation"><input checked={eligibilityAttestation} onChange={(event) => setEligibilityAttestation(event.target.checked)} type="checkbox" /><span>我已在本人平台账号后台核对该拟挂商品的状态。</span></label>}
+                      <div className="eligibility-actions"><button className="button button-primary" disabled={busy === "eligibility" || candidate.eligibility_status === "manually_confirmed" || !eligibilityAttestation || !eligibilityNote.trim()} onClick={() => void updateEligibility("manually_confirmed")} type="button">{busy === "eligibility" ? "保存中…" : "记录人工核对"}<span>✓</span></button>{candidate.eligibility_status === "manually_confirmed" && <button className="button button-danger" disabled={busy === "eligibility"} onClick={() => void updateEligibility("unverified")} type="button">撤回核对</button>}</div>
+                      <p className="eligibility-disclaimer">这只是创作者提供的人工记录，不是平台认证，也不是系统验证。撤回后，后续审核和发布包会使用最新状态。</p>
+                    </div>
+                  )}
                   <form className="form-grid" onSubmit={saveCandidate}>
                     <Field label="发布平台" required><select disabled={!book || Boolean(candidate)} onChange={(event) => setCandidateDraft({ ...candidateDraft, platform: event.target.value as Platform })} value={candidateDraft.platform}><option value="douyin">抖音</option><option value="kuaishou">快手</option></select></Field>
                     <Field label="平台商品 ID" required><input disabled={!book || Boolean(candidate)} onChange={(event) => setCandidateDraft({ ...candidateDraft, productId: event.target.value })} placeholder="手工填写拟挂商品 ID" value={candidateDraft.productId} /></Field>
                     <div className="field span-2"><label>商品链接 <em>*</em></label><input disabled={!book || Boolean(candidate)} onChange={(event) => setCandidateDraft({ ...candidateDraft, productUrl: event.target.value })} placeholder="https://…" required type="url" value={candidateDraft.productUrl} /></div>
-                    <div className="field span-2"><label>核对说明</label><textarea disabled={!book || Boolean(candidate)} onChange={(event) => setCandidateDraft({ ...candidateDraft, eligibilityNote: event.target.value })} placeholder="未核实时说明缺少什么；已在平台客户端核对时记录核对范围。" rows={2} value={candidateDraft.eligibilityNote} /></div>
-                    <label className={`attestation span-2 ${mode === "demo" ? "attestation-disabled" : ""}`}>
-                      <input checked={manualCandidateConfirmation} disabled={!book || Boolean(candidate) || mode === "demo" || isSampleLoaded} onChange={(event) => setManualCandidateConfirmation(event.target.checked)} type="checkbox" />
-                      <span><strong>我已在自己的平台客户端手动核对该商品的可推广状态。</strong><small>只记录你对拟挂商品的人工确认，不调用平台接口，也不代表平台确认可推广。账号资质仍需单独在平台后台核对。</small></span>
-                    </label>
-                    <div className="form-actions span-2"><button className="button button-secondary" disabled={!book || Boolean(candidate) || busy === "candidate"} type="submit">{busy === "candidate" ? "保存中…" : candidate ? "拟挂商品已保存" : "保存拟挂商品"}<span>→</span></button><span>演示商品 ID 是占位文本，始终保持未核实。</span></div>
+                    <div className="field span-2"><label>未核实说明（可选）</label><textarea disabled={!book || Boolean(candidate)} onChange={(event) => setCandidateDraft({ ...candidateDraft, eligibilityNote: event.target.value })} placeholder="资格尚未核实时，说明目前缺少的信息。" rows={2} value={candidateDraft.eligibilityNote} /></div>
+                    <div className="form-actions span-2"><button className="button button-secondary" disabled={!book || Boolean(candidate) || busy === "candidate"} type="submit">{busy === "candidate" ? "保存中…" : candidate ? "拟挂商品已保存" : "保存拟挂商品"}<span>→</span></button><span>新建记录始终为“未核实”。保存后如已在本人账号后台完成核对，请通过上方独立资格记录面板提交。</span></div>
                   </form>
                 </>
               )}
@@ -1028,6 +1381,7 @@ function App() {
                       <div className="section-divider" />
                       <div className="evidence-heading"><div><span className="eyebrow">OPTIONAL · MANUAL ONLY</span><h2>补充一条人工证据</h2><p>只记录你提供的来源。此处不采集平台数据或自动抓取网页。</p></div><span className="mini-tag">没有来源也可以继续</span></div>
                       {evidence && <div className="evidence-saved"><span>✓</span><div><strong>人工证据已保存</strong><small>{evidence.source_note} · {evidence.metric_value === null ? evidence.missing_reason : `${evidence.metric_name}: ${evidence.metric_value}`}</small></div></div>}
+                      {workspaceEvidence.length > 0 && <div className="restored-evidence-list" aria-label="已恢复的证据记录">{workspaceEvidence.map((item) => <article className="restored-evidence" key={item.id}><strong>{item.source_type === "manual" ? "人工来源" : "已授权来源"} · {item.source_note}</strong><small>依据：{item.usage_basis} · 观察于 {formatTime(item.observed_at)}</small><small>{item.metric_value === null ? `指标缺失：${item.missing_reason || "未填写原因"}` : `${item.metric_name || "指标"}：${item.metric_value} · 时间窗 ${formatTime(item.metric_window_start ?? undefined)} 至 ${formatTime(item.metric_window_end ?? undefined)}`}</small>{item.source_url && <a href={item.source_url} rel="noreferrer" target="_blank">查看来源链接</a>}</article>)}</div>}
                       <form className="form-grid evidence-form" onSubmit={saveEvidence}>
                         <Field label="来源说明" required><input disabled={Boolean(evidence)} onChange={(event) => setEvidenceDraft({ ...evidenceDraft, sourceNote: event.target.value })} placeholder="例如：创作者手工观察记录" required value={evidenceDraft.sourceNote} /></Field>
                         <Field label="来源链接（可选）"><input disabled={Boolean(evidence)} onChange={(event) => setEvidenceDraft({ ...evidenceDraft, sourceUrl: event.target.value })} placeholder="https://…" type="url" value={evidenceDraft.sourceUrl} /></Field>
@@ -1099,16 +1453,22 @@ function App() {
                     <>
                       <div className="review-state-card">
                         <div className="state-icon">{run.status === "waiting_review" ? "◉" : "◷"}</div>
-                        <div><span className="eyebrow">RUN {shortId(run.id)}</span><strong>{statusName(run.status)} <i>·</i> {stageName(run.stage)}</strong><small>当前审核版本：v{selectedVersion.version_number} · {formatTime(run.updated_at)}</small></div>
+                        <div><span className="eyebrow">RUN {shortId(run.id)}</span><strong>{statusName(run.status)} <i>·</i> {stageName(run.stage)}</strong><small>当前审核版本：v{selectedVersion.version_number} · 第 {run.attempt} 轮 · {formatTime(run.updated_at)}</small></div>
                         <span className={`run-pill ${run.status}`}>{statusName(run.status)}</span>
                       </div>
+                      {mode === "api" && <div className="task-actions">
+                        {run.cancel_requested_at && <p className="task-action-note">已在 {formatTime(run.cancel_requested_at)} 请求取消，等待 worker 确认停止。</p>}
+                        {run.status === "failed" && <p className="task-action-note">{run.error_message || "任务失败。请查看事件记录，确认修改范围后再重试。"}{run.error_code ? `（${run.error_code}）` : ""}</p>}
+                        {!["failed", "cancelled", "succeeded"].includes(run.status) && !run.cancel_requested_at && <><Field label="取消原因（可选）"><input onChange={(event) => setCancelReason(event.target.value)} placeholder="例如：需要先修改脚本" value={cancelReason} /></Field><button className="button button-danger" disabled={busy === "cancel-run"} onClick={() => void cancelCurrentRun()} type="button">{busy === "cancel-run" ? "取消请求中…" : "取消任务"}<span>×</span></button></>}
+                        {run.status === "failed" && <button className="button button-secondary" disabled={busy === "retry-run"} onClick={() => void retryCurrentRun()} type="button">{busy === "retry-run" ? "提交中…" : `重试任务（第 ${run.attempt + 1} 轮）`}<span>↻</span></button>}
+                      </div>}
                       <div className="review-bookkeeping">
                         <div><span>事实状态</span><strong>{factsHaveSources ? "有来源或本人已确认" : "含未核实事实"}</strong></div>
                         <div><span>拟挂商品</span><strong>{candidate?.eligibility_status === "manually_confirmed" ? "已记录人工核对" : "平台资格未核实"}</strong></div>
                         <div><span>素材范围</span><strong>原创文字 / 自制图形</strong></div>
                       </div>
                       {mode === "demo" && <div className="inline-warning"><span>!</span><p>此虚构样例中的商品 ID 不是实际商品，审核通过会被阻止；可以在本地演示中记录驳回，不能模拟真实资格。</p></div>}
-                      {candidate?.eligibility_status !== "manually_confirmed" && mode === "api" && <div className="inline-warning"><span>!</span><p>该候选商品没有记录平台客户端的人工核对。冻结契约没有更新商品资格的接口，请在保存候选商品时记录人工核对，或由集成负责人补充接口。</p></div>}
+                      {candidate?.eligibility_status !== "manually_confirmed" && mode === "api" && <div className="inline-warning"><span>!</span><p>该候选商品没有人工核对记录。可回到“选书与商品”更新资格；通过审核前，服务端也会再次检查当前状态。</p></div>}
 
                       <form className="review-form" onSubmit={submitReview}>
                         <div className="review-choice-row"><div><span className="eyebrow">YOUR DECISION</span><h2>这版脚本的审核结论</h2></div><div className="decision-toggle"><button className={reviewDecision === "approve" ? "active" : ""} onClick={() => setReviewDecision("approve")} type="button">通过</button><button className={reviewDecision === "reject" ? "active reject-active" : ""} onClick={() => setReviewDecision("reject")} type="button">退回修改</button></div></div>
@@ -1139,9 +1499,11 @@ function App() {
                         <div className="demo-package-note"><span className="demo-stamp">SAMPLE</span><div><strong>这是核对卡预览，不是可发布的视频包。</strong><p>虚构商品资格未核实，演示模式没有视频文件。你可以下载 JSON 格式的本地核对卡预览。</p></div></div>
                       ) : (
                         <div className="render-box">
-                          <div className="render-box-head"><div className="render-glyph">▧</div><div><strong>{renderJob ? `渲染 ${shortId(renderJob.id)}` : "竖屏文字动效成片"}</strong><small>{renderJob ? `${statusName(renderJob.status)}${renderJob.error_message ? ` · ${renderJob.error_message}` : ""}` : "1080 × 1920 · 使用审核通过的脚本"}</small></div>{renderJob && <span className={`run-pill ${renderJob.status}`}>{statusName(renderJob.status)}</span>}</div>
+                          <div className="render-box-head"><div className="render-glyph">▧</div><div><strong>{renderJob ? `渲染 ${shortId(renderJob.id)}` : "竖屏文字动效成片"}</strong><small>{renderJob ? `${statusName(renderJob.status)} · 第 ${renderJob.attempt} 轮 · 更新于 ${formatTime(renderJob.updated_at)}${renderJob.error_message ? ` · ${renderJob.error_message}` : ""}` : "1080 × 1920 · 使用审核通过的脚本"}</small></div>{renderJob && <span className={`run-pill ${renderJob.status}`}>{statusName(renderJob.status)}</span>}</div>
                           <label className="attestation render-attestation"><input checked={renderRightsConfirmed} onChange={(event) => setRenderRightsConfirmed(event.target.checked)} type="checkbox" /><span><strong>我确认本次使用的文字为原创内容，自制图形可用于本次渲染。</strong><small>默认静音；无许可凭据的外部图片、音乐、肖像和声音不会进入成片。</small></span></label>
-                          <div className="render-box-actions"><button className="button button-primary" disabled={busy === "render" || !selectedVersionApproved || !renderRightsConfirmed || !candidateIsManuallyConfirmed || Boolean(renderJob && ["queued", "running"].includes(renderJob.status))} onClick={() => void startRender()} type="button">{busy === "render" ? "提交中…" : renderJob && ["queued", "running"].includes(renderJob.status) ? "渲染进行中" : renderJob?.status === "succeeded" ? "重新提交渲染" : "提交渲染"}<span>→</span></button><span>{!selectedVersionApproved ? "选择一版审核通过的脚本。" : !candidateIsManuallyConfirmed ? "先记录平台客户端人工核对。" : "仅提交给 API，不会发布到平台。"}</span></div>
+                          {renderJob?.cancel_requested_at && <p className="task-action-note">已请求取消渲染，等待 worker 确认停止。</p>}
+                          {renderJob && mode === "api" && ["queued", "running"].includes(renderJob.status) && !renderJob.cancel_requested_at && <div className="render-cancel-row"><Field label="取消原因（可选）"><input onChange={(event) => setCancelReason(event.target.value)} placeholder="例如：先修订审核脚本" value={cancelReason} /></Field><button className="button button-danger" disabled={busy === "cancel-render"} onClick={() => void cancelCurrentRender()} type="button">{busy === "cancel-render" ? "取消请求中…" : "取消渲染"}<span>×</span></button></div>}
+                          <div className="render-box-actions"><button className="button button-primary" disabled={busy === "render" || !selectedVersionApproved || !renderRightsConfirmed || !candidateIsManuallyConfirmed || Boolean(renderJob && ["queued", "running"].includes(renderJob.status))} onClick={() => void startRender()} type="button">{busy === "render" ? "提交中…" : renderJob && ["queued", "running"].includes(renderJob.status) ? "渲染进行中" : renderJob?.status === "failed" ? "另建渲染任务" : renderJob?.status === "succeeded" ? "另建渲染任务" : "提交渲染"}<span>→</span></button>{renderJob?.status === "failed" && <button className="button button-secondary" disabled={busy === "retry-render"} onClick={() => void retryCurrentRender()} type="button">{busy === "retry-render" ? "提交中…" : `重试原任务（第 ${renderJob.attempt + 1} 轮）`}<span>↻</span></button>}<span>{!selectedVersionApproved ? "选择一版审核通过的脚本。" : !candidateIsManuallyConfirmed ? "先记录平台客户端人工核对。" : "仅提交给 API，不会发布到平台。"}</span></div>
                         </div>
                       )}
 
@@ -1183,7 +1545,7 @@ function App() {
                 <div className="data-card-title"><span className="data-icon">↗</span><div><span className="eyebrow">DATA & RIGHTS</span><h2>数据与素材</h2></div></div>
                 <div className="data-state"><span className="state-led" /><div><strong>授权平台数据未取得</strong><small>当前仅支持人工输入</small></div></div>
                 <ul className="data-rules"><li>没有授权时不展示销量或竞品数据。</li><li>书封、内文、商品图、音乐和肖像默认不可用。</li><li>视频发布与挂车由你手动完成。</li></ul>
-                <div className="data-source"><span>数据源</span><strong>{evidence ? `人工 · ${evidence.source_note}` : "尚未添加人工证据"}</strong></div>
+                 <div className="data-source"><span>数据源</span><strong>{primaryEvidence ? `${primaryEvidence.source_type === "manual" ? "人工" : "已授权"} · ${workspaceEvidence.length || 1} 条记录 · ${primaryEvidence.source_note}` : "尚未添加人工证据"}</strong></div>
               </div>
               <div className="rail-card current-record-card">
                 <div className="rail-card-heading"><div><span className="eyebrow">CURRENT RECORD</span><h2>当前项目</h2></div><span className="record-badge">{project ? "活跃" : "草稿"}</span></div>

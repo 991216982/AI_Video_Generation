@@ -6,7 +6,7 @@ import json
 from typing import Callable
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, BackgroundTasks, Header, Request
+from fastapi import APIRouter, BackgroundTasks, Header, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.routing import APIRoute
@@ -14,12 +14,17 @@ from fastapi.routing import APIRoute
 from book_video.api.schemas import (
     BookCreate,
     BookEdition,
+    BookPage,
+    CancelRequest,
     CreativeProject,
     CreativeProjectCreate,
+    CreativeProjectPage,
+    CreativeWorkspace,
     Evidence,
     EvidenceCreate,
     PromotionCandidate,
     PromotionCandidateCreate,
+    PromotionEligibilityUpdate,
     PublicationPackage,
     RenderCreate,
     RenderJob,
@@ -100,6 +105,18 @@ def create_api_router(
         return domain.create_book(data)
 
     @router.get(
+        "/books",
+        operation_id="listBooks",
+        response_model=BookPage,
+    )
+    def list_books(
+        limit: int = Query(default=20, ge=1, le=100),
+        cursor: str | None = Query(default=None, min_length=1),
+        q: str | None = Query(default=None, max_length=100),
+    ) -> dict:
+        return domain.list_books(limit=limit, cursor=cursor, q=q)
+
+    @router.get(
         "/books/{book_id}",
         operation_id="getBook",
         response_model=BookEdition,
@@ -112,7 +129,6 @@ def create_api_router(
         "/promotion-candidates",
         operation_id="createPromotionCandidate",
         response_model=PromotionCandidate,
-        response_model_exclude_none=True,
         status_code=201,
     )
     def create_promotion_candidate(data: PromotionCandidateCreate) -> dict:
@@ -122,10 +138,19 @@ def create_api_router(
         "/promotion-candidates/{candidate_id}",
         operation_id="getPromotionCandidate",
         response_model=PromotionCandidate,
-        response_model_exclude_none=True,
     )
     def get_promotion_candidate(candidate_id: UUID) -> dict:
         return domain.get_promotion_candidate(candidate_id)
+
+    @router.patch(
+        "/promotion-candidates/{candidate_id}/eligibility",
+        operation_id="updatePromotionEligibility",
+        response_model=PromotionCandidate,
+    )
+    def update_promotion_eligibility(
+        candidate_id: UUID, data: PromotionEligibilityUpdate
+    ) -> dict:
+        return domain.update_promotion_eligibility(candidate_id, data)
 
     @router.post(
         "/evidence",
@@ -148,6 +173,20 @@ def create_api_router(
         return domain.create_creative_project(data)
 
     @router.get(
+        "/creative-projects",
+        operation_id="listCreativeProjects",
+        response_model=CreativeProjectPage,
+    )
+    def list_creative_projects(
+        limit: int = Query(default=20, ge=1, le=100),
+        cursor: str | None = Query(default=None, min_length=1),
+        book_id: UUID | None = None,
+    ) -> dict:
+        return domain.list_creative_projects(
+            limit=limit, cursor=cursor, book_id=book_id
+        )
+
+    @router.get(
         "/creative-projects/{project_id}",
         operation_id="getCreativeProject",
         response_model=CreativeProject,
@@ -155,6 +194,20 @@ def create_api_router(
     )
     def get_creative_project(project_id: UUID) -> dict:
         return domain.get_creative_project(project_id)
+
+    @router.get(
+        "/creative-projects/{project_id}/workspace",
+        operation_id="getCreativeWorkspace",
+        response_model=CreativeWorkspace,
+    )
+    def get_creative_workspace(project_id: UUID, request: Request) -> dict:
+        workspace = domain.get_creative_workspace(project_id)
+        package = workspace.get("publication_package")
+        if package is not None:
+            package["video_download_url"] = str(
+                request.url_for("downloadRender", render_id=package["render_id"])
+            )
+        return workspace
 
     @router.get(
         "/creative-projects/{project_id}/scripts",
@@ -179,7 +232,6 @@ def create_api_router(
         "/creative-projects/{project_id}/runs",
         operation_id="startRun",
         response_model=Run,
-        response_model_exclude_none=True,
         status_code=202,
     )
     def start_run(
@@ -203,7 +255,6 @@ def create_api_router(
         "/runs/{run_id}",
         operation_id="getRun",
         response_model=Run,
-        response_model_exclude_none=True,
     )
     def get_run(run_id: UUID) -> dict:
         return domain.get_run(run_id)
@@ -238,16 +289,38 @@ def create_api_router(
         "/runs/{run_id}/review",
         operation_id="reviewRun",
         response_model=Run,
-        response_model_exclude_none=True,
     )
     def review_run(run_id: UUID, data: ReviewRequest) -> dict:
         return domain.review_run(run_id, data)
 
     @router.post(
+        "/runs/{run_id}/cancel",
+        operation_id="cancelRun",
+        response_model=Run,
+    )
+    def cancel_run(
+        run_id: UUID,
+        data: CancelRequest,
+        idempotency_key: str = Header(alias="Idempotency-Key", min_length=8, max_length=128),
+    ) -> dict:
+        return domain.cancel_run(run_id, data, idempotency_key)
+
+    @router.post(
+        "/runs/{run_id}/retry",
+        operation_id="retryRun",
+        response_model=Run,
+        status_code=202,
+    )
+    def retry_run(
+        run_id: UUID,
+        idempotency_key: str = Header(alias="Idempotency-Key", min_length=8, max_length=128),
+    ) -> dict:
+        return domain.retry_run(run_id, idempotency_key)
+
+    @router.post(
         "/renders",
         operation_id="startRender",
         response_model=RenderJob,
-        response_model_exclude_none=True,
         status_code=202,
     )
     def start_render(
@@ -269,10 +342,33 @@ def create_api_router(
         "/renders/{render_id}",
         operation_id="getRender",
         response_model=RenderJob,
-        response_model_exclude_none=True,
     )
     def get_render(render_id: UUID) -> dict:
         return domain.get_render(render_id)
+
+    @router.post(
+        "/renders/{render_id}/cancel",
+        operation_id="cancelRender",
+        response_model=RenderJob,
+    )
+    def cancel_render(
+        render_id: UUID,
+        data: CancelRequest,
+        idempotency_key: str = Header(alias="Idempotency-Key", min_length=8, max_length=128),
+    ) -> dict:
+        return domain.cancel_render(render_id, data, idempotency_key)
+
+    @router.post(
+        "/renders/{render_id}/retry",
+        operation_id="retryRender",
+        response_model=RenderJob,
+        status_code=202,
+    )
+    def retry_render(
+        render_id: UUID,
+        idempotency_key: str = Header(alias="Idempotency-Key", min_length=8, max_length=128),
+    ) -> dict:
+        return domain.retry_render(render_id, idempotency_key)
 
     @router.get(
         "/renders/{render_id}/download",

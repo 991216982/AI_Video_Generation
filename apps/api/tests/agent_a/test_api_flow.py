@@ -511,7 +511,11 @@ def test_sqlite_migration_survives_database_reopen(tmp_path) -> None:
     assert reopened.get_book(book["id"]) == book
     with reopened.database.read() as conn:
         migrations = conn.execute("SELECT version FROM schema_migrations").fetchall()
-    assert [row[0] for row in migrations] == ["001_initial"]
+    assert [row[0] for row in migrations] == [
+        "001_initial",
+        "002_w2_reliability",
+        "003_render_execution_lease",
+    ]
 
 
 def test_default_database_path_is_local_and_environment_override_creates_parent(
@@ -561,3 +565,697 @@ def test_render_rejects_output_outside_server_artifact_root(tmp_path) -> None:
     else:
         raise AssertionError("render output outside the artifact root was accepted")
     assert service.get_render(render["id"])["status"] == "queued"
+
+
+def test_books_projects_and_workspace_are_stable_owner_scoped_and_reopenable(tmp_path) -> None:
+    client, service, _ = _app(tmp_path)
+    evidence = client.post(
+        "/api/v1/evidence",
+        json={
+            "source_type": "manual",
+            "source_note": "虚构演示来源，仅用于测试",
+            "source_url": None,
+            "observed_at": datetime.now(timezone.utc).isoformat(),
+            "usage_basis": "虚构演示数据",
+            "metric_name": None,
+            "metric_value": None,
+            "metric_window_start": None,
+            "metric_window_end": None,
+            "missing_reason": "演示数据没有指标",
+        },
+    ).json()
+    book_body = _book_body()
+    book_body["facts"][0]["evidence_id"] = evidence["id"]
+    book = client.post("/api/v1/books", json=book_body).json()
+    candidate = client.post(
+        "/api/v1/promotion-candidates", json=_candidate_body(book["id"])
+    ).json()
+    project_body = _project_body(book["id"], candidate["id"])
+    project_body["evidence_ids"] = [evidence["id"]]
+    projects = [
+        client.post("/api/v1/creative-projects", json=project_body).json()
+        for _ in range(2)
+    ]
+    scripts = [
+        client.post(
+            f"/api/v1/creative-projects/{project['id']}/scripts", json=_script_body()
+        ).json()
+        for project in projects
+    ]
+    run = client.post(
+        f"/api/v1/creative-projects/{projects[0]['id']}/runs",
+        headers={"Idempotency-Key": "workspace-run-key"},
+        json={"brief_version": 1},
+    ).json()
+
+    books_page = client.get("/api/v1/books", params={"limit": 1, "q": "地图"})
+    assert books_page.status_code == 200
+    assert books_page.json()["items"][0]["id"] == book["id"]
+    assert books_page.json()["next_cursor"] is None
+    project_page = client.get(
+        "/api/v1/creative-projects",
+        params={"limit": 1, "book_id": book["id"]},
+    )
+    assert project_page.status_code == 200
+    assert project_page.json()["next_cursor"] is not None
+    second_page = client.get(
+        "/api/v1/creative-projects",
+        params={
+            "limit": 1,
+            "book_id": book["id"],
+            "cursor": project_page.json()["next_cursor"],
+        },
+    )
+    assert second_page.status_code == 200
+    ordered_ids = [
+        project_page.json()["items"][0]["id"],
+        second_page.json()["items"][0]["id"],
+    ]
+    expected_ids = [
+        project["id"]
+        for project in sorted(
+            projects, key=lambda item: (item["created_at"], item["id"]), reverse=True
+        )
+    ]
+    assert ordered_ids == expected_ids
+    filter_mismatch = client.get(
+        "/api/v1/creative-projects",
+        params={
+            "limit": 1,
+            "book_id": "00000000-0000-4000-8000-000000000099",
+            "cursor": project_page.json()["next_cursor"],
+        },
+    )
+    assert filter_mismatch.status_code == 422
+    assert filter_mismatch.json()["code"] == "invalid_cursor"
+
+    workspace = client.get(f"/api/v1/creative-projects/{projects[0]['id']}/workspace")
+    assert workspace.status_code == 200, workspace.text
+    assert workspace.json()["book"]["id"] == book["id"]
+    assert workspace.json()["promotion_candidate"]["id"] == candidate["id"]
+    assert [item["id"] for item in workspace.json()["evidence"]] == [evidence["id"]]
+    assert [item["id"] for item in workspace.json()["script_versions"]] == [scripts[0]["id"]]
+    assert workspace.json()["runs"][0]["id"] == run["id"]
+    assert workspace.json()["render_jobs"] == []
+    assert workspace.json()["publication_package"] is None
+
+    service.database.close()
+    reopened = DomainService(
+        Database(tmp_path / "api-flow.sqlite3"),
+        owner_user_id=OWNER_ID,
+        render_output_dir=tmp_path / "renders",
+    )
+    saved = reopened.get_creative_workspace(projects[0]["id"])
+    assert saved["book"]["id"] == book["id"]
+    assert len(saved["evidence"]) == 1
+    assert len(saved["script_versions"]) == 1
+    assert saved["runs"][0]["id"] == run["id"]
+    other_owner = DomainService(
+        reopened.database,
+        owner_user_id="00000000-0000-4000-8000-000000000002",
+    )
+    try:
+        other_owner.get_creative_workspace(projects[0]["id"])
+    except Exception as error:
+        assert getattr(error, "status_code", None) == 404
+    else:
+        raise AssertionError("another owner unexpectedly read a creative workspace")
+
+
+def test_eligibility_revision_conflict_revocation_and_manual_update(tmp_path) -> None:
+    client, service, _ = _app(tmp_path)
+    book = client.post("/api/v1/books", json=_book_body()).json()
+    candidate_response = client.post(
+        "/api/v1/promotion-candidates",
+        json=_candidate_body(book["id"], confirmed=False),
+    )
+    assert candidate_response.status_code == 201, candidate_response.text
+    candidate = candidate_response.json()
+    assert candidate["eligibility_revision"] == 1
+    assert candidate["eligibility_checked_by_user_id"] is None
+    assert candidate["eligibility_checked_at"] is None
+
+    confirmed = client.patch(
+        f"/api/v1/promotion-candidates/{candidate['id']}/eligibility",
+        json={
+            "eligibility_status": "manually_confirmed",
+            "expected_revision": 1,
+            "eligibility_note": "虚构演示：已人工查看账号后台",
+            "confirmation_basis": "creator_account_backend",
+        },
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    assert confirmed.json()["eligibility_revision"] == 2
+    assert confirmed.json()["eligibility_checked_by_user_id"] == OWNER_ID
+    assert confirmed.json()["eligibility_checked_at"] is not None
+
+    conflict_response = client.patch(
+        f"/api/v1/promotion-candidates/{candidate['id']}/eligibility",
+        json={
+            "eligibility_status": "unverified",
+            "expected_revision": 1,
+            "eligibility_note": None,
+            "confirmation_basis": None,
+        },
+    )
+    assert conflict_response.status_code == 409
+    assert conflict_response.json()["code"] == "revision_conflict"
+
+    revoked = client.patch(
+        f"/api/v1/promotion-candidates/{candidate['id']}/eligibility",
+        json={
+            "eligibility_status": "unverified",
+            "expected_revision": 2,
+            "eligibility_note": None,
+            "confirmation_basis": None,
+        },
+    )
+    assert revoked.status_code == 200, revoked.text
+    assert revoked.json()["eligibility_revision"] == 3
+    assert revoked.json()["eligibility_checked_at"] is None
+    assert revoked.json()["eligibility_checked_by_user_id"] is None
+    assert revoked.json()["eligibility_note"] is None
+
+    project = client.post(
+        "/api/v1/creative-projects",
+        json=_project_body(book["id"], candidate["id"]),
+    ).json()
+    script = client.post(
+        f"/api/v1/creative-projects/{project['id']}/scripts", json=_script_body()
+    ).json()
+    run = client.post(
+        f"/api/v1/creative-projects/{project['id']}/runs",
+        headers={"Idempotency-Key": "revoked-run-key"},
+        json={"brief_version": 1},
+    ).json()
+    service.transition_run(run["id"], status="running", stage="script")
+    service.transition_run(run["id"], status="waiting_review", stage="review")
+    review = _approve(client, run["id"], script["id"])
+    assert review.status_code == 409
+    assert review.json()["code"] == "product_not_confirmed"
+
+
+def test_cancel_and_retry_run_are_idempotent_and_attempted(tmp_path) -> None:
+    client, service, _ = _app(tmp_path)
+    book = client.post("/api/v1/books", json=_book_body()).json()
+    candidate = client.post(
+        "/api/v1/promotion-candidates", json=_candidate_body(book["id"])
+    ).json()
+    project = client.post(
+        "/api/v1/creative-projects",
+        json=_project_body(book["id"], candidate["id"]),
+    ).json()
+
+    queued = client.post(
+        f"/api/v1/creative-projects/{project['id']}/runs",
+        headers={"Idempotency-Key": "cancel-queued-run"},
+        json={"brief_version": 1},
+    ).json()
+    assert queued["attempt"] == 1
+    assert queued["cancel_requested_at"] is None
+    cancel_headers = {"Idempotency-Key": "cancel-queued-action"}
+    cancel_body = {"reason": "虚构演示：取消排队任务"}
+    cancelled = client.post(
+        f"/api/v1/runs/{queued['id']}/cancel", headers=cancel_headers, json=cancel_body
+    )
+    replayed_cancel = client.post(
+        f"/api/v1/runs/{queued['id']}/cancel", headers=cancel_headers, json=cancel_body
+    )
+    assert cancelled.status_code == replayed_cancel.status_code == 200
+    assert cancelled.json() == replayed_cancel.json()
+    assert cancelled.json()["status"] == "cancelled"
+    assert [event["sequence"] for event in service.list_run_events(queued["id"])] == [1, 2]
+    key_conflict = client.post(
+        f"/api/v1/runs/{queued['id']}/cancel",
+        headers=cancel_headers,
+        json={"reason": "不同请求"},
+    )
+    assert key_conflict.status_code == 409
+    assert key_conflict.json()["code"] == "idempotency_key_conflict"
+
+    failed = client.post(
+        f"/api/v1/creative-projects/{project['id']}/runs",
+        headers={"Idempotency-Key": "retry-failed-run"},
+        json={"brief_version": 1},
+    ).json()
+    service.transition_run(failed["id"], status="running", stage="script")
+    service.transition_run(
+        failed["id"], status="failed", reason_code="demo_failure", message="虚构失败"
+    )
+    retry_headers = {"Idempotency-Key": "retry-run-action-01"}
+    retried = client.post(
+        f"/api/v1/runs/{failed['id']}/retry", headers=retry_headers
+    )
+    replayed_retry = client.post(
+        f"/api/v1/runs/{failed['id']}/retry", headers=retry_headers
+    )
+    assert retried.status_code == replayed_retry.status_code == 202
+    assert retried.json() == replayed_retry.json()
+    assert retried.json()["id"] == failed["id"]
+    assert retried.json()["attempt"] == 2
+    assert retried.json()["status"] == "queued"
+    events = service.list_run_events(failed["id"])
+    retries = [event for event in events if event["type"] == "run.retry_requested"]
+    assert len(retries) == 1
+    assert retries[0]["attempt"] == 2
+    assert [event["sequence"] for event in events] == list(range(1, len(events) + 1))
+    service.transition_run(failed["id"], status="running", stage="script")
+    service.transition_run(failed["id"], status="succeeded", stage="complete")
+    rejected_retry = client.post(
+        f"/api/v1/runs/{failed['id']}/retry",
+        headers={"Idempotency-Key": "retry-success-run"},
+    )
+    assert rejected_retry.status_code == 409
+    assert rejected_retry.json()["code"] == "invalid_state_transition"
+
+
+def test_running_cancellation_is_persisted_and_worker_must_confirm(tmp_path) -> None:
+    client, service, _ = _app(tmp_path)
+    client.app.state.domain_service = service
+    _book, _candidate, _project, script, run = _ready_flow(client)
+    assert _approve(client, run["id"], script["id"]).status_code == 200
+    assert service.claim_next_reviewed_run()["id"] == run["id"]
+    before_sequence = service.get_run(run["id"])["sequence"]
+    headers = {"Idempotency-Key": "running-cancel-action"}
+    body = {"reason": "虛构演示：停止执行中任务"}
+    response = client.post(f"/api/v1/runs/{run['id']}/cancel", headers=headers, json=body)
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "running"
+    assert response.json()["cancel_requested_at"] is not None
+    assert service.is_run_cancel_requested(run["id"])
+    assert service.claim_next_reviewed_run() is None
+    assert response.json()["sequence"] == before_sequence + 1
+    blocked_success = None
+    try:
+        service.transition_run(run["id"], status="succeeded", stage="complete")
+    except Exception as error:
+        blocked_success = error
+    assert getattr(blocked_success, "code", None) == "invalid_state_transition"
+    with service.database.transaction() as conn:
+        conn.execute(
+            "UPDATE runs SET review_resume_claimed_at = ? WHERE id = ?",
+            ("2000-01-01T00:00:00.000Z", run["id"]),
+        )
+    assert service.claim_next_reviewed_run()["id"] == run["id"]
+    cancelled = service.confirm_run_cancelled(run["id"], "虚构演示：worker 已停止")
+    assert cancelled["status"] == "cancelled"
+    assert [event["sequence"] for event in service.list_run_events(run["id"])] == list(
+        range(1, cancelled["sequence"] + 1)
+    )
+
+
+def test_running_run_can_be_reclaimed_after_execution_lease_expires(tmp_path) -> None:
+    client, service, _ = _app(tmp_path)
+    book = client.post("/api/v1/books", json=_book_body()).json()
+    candidate = client.post(
+        "/api/v1/promotion-candidates", json=_candidate_body(book["id"])
+    ).json()
+    project = client.post(
+        "/api/v1/creative-projects",
+        json=_project_body(book["id"], candidate["id"]),
+    ).json()
+    run = client.post(
+        f"/api/v1/creative-projects/{project['id']}/runs",
+        headers={"Idempotency-Key": "recover-run-after-crash"},
+        json={"brief_version": 1},
+    ).json()
+    claimed = service.claim_next_run()
+    assert claimed["id"] == run["id"]
+    assert service.claim_next_resumable_run(lease_seconds=300) is None
+    with service.database.transaction() as conn:
+        conn.execute(
+            "UPDATE runs SET execution_claimed_at = ? WHERE id = ?",
+            ("2000-01-01T00:00:00.000Z", run["id"]),
+        )
+    resumed = service.claim_next_resumable_run(lease_seconds=300)
+    assert resumed["id"] == run["id"]
+    assert resumed["attempt"] == 1
+    assert service.claim_next_resumable_run(lease_seconds=300) is None
+    assert service.get_run_snapshot(run["id"])["run"]["id"] == run["id"]
+    assert service.renew_run_execution_claim(run["id"])
+    service.release_run_execution_claim(run["id"])
+    assert service.claim_next_resumable_run(lease_seconds=300)["id"] == run["id"]
+
+    canceled = client.post(
+        f"/api/v1/runs/{run['id']}/cancel",
+        headers={"Idempotency-Key": "recover-cancel-run"},
+        json={"reason": "虛构演示：终止恢复中的任务"},
+    )
+    assert canceled.status_code == 200
+    assert service.claim_next_resumable_run(lease_seconds=300) is None
+    with service.database.transaction() as conn:
+        conn.execute(
+            "UPDATE runs SET execution_claimed_at = ? WHERE id = ?",
+            ("2000-01-01T00:00:00.000Z", run["id"]),
+        )
+    assert service.claim_next_resumable_run(lease_seconds=300)["id"] == run["id"]
+    assert service.confirm_run_cancelled(run["id"])["status"] == "cancelled"
+
+
+def test_running_render_can_be_reclaimed_and_cancelled_after_worker_crash(tmp_path) -> None:
+    client, service, _ = _app(tmp_path)
+    client.app.state.domain_service = service
+    _book, candidate, project, script, run = _ready_flow(client)
+    assert _approve(client, run["id"], script["id"]).status_code == 200
+    service.transition_run(run["id"], status="running", stage="storyboard")
+    render_body = {
+        "project_id": project["id"],
+        "script_version_id": script["id"],
+        "promotion_candidate_id": candidate["id"],
+        "width": 1080,
+        "height": 1920,
+        "asset_rights": [
+            {"origin": "self_created_graphic", "usage_status": "allowed"},
+            {"origin": "self_created_text", "usage_status": "allowed"},
+        ],
+    }
+    render = client.post(
+        "/api/v1/renders",
+        headers={"Idempotency-Key": "render-recovery-crash"},
+        json=render_body,
+    ).json()
+    assert service.claim_next_render()["id"] == render["id"]
+    assert service.claim_next_resumable_render(lease_seconds=300) is None
+    with service.database.transaction() as conn:
+        conn.execute(
+            "UPDATE render_jobs SET execution_claimed_at = ? WHERE id = ?",
+            ("2000-01-01T00:00:00.000Z", render["id"]),
+        )
+    recovered = service.claim_next_resumable_render(lease_seconds=300)
+    assert recovered["id"] == render["id"]
+    assert recovered["attempt"] == 1
+    assert service.claim_next_resumable_render(lease_seconds=300) is None
+    assert service.renew_render_execution_claim(render["id"])
+
+    canceled = client.post(
+        f"/api/v1/renders/{render['id']}/cancel",
+        headers={"Idempotency-Key": "render-recovery-cancel"},
+        json={"reason": "虚构演示：worker 中断后确认取消"},
+    )
+    assert canceled.status_code == 200
+    assert canceled.json()["status"] == "running"
+    assert service.claim_next_resumable_render(lease_seconds=300) is None
+    with service.database.transaction() as conn:
+        conn.execute(
+            "UPDATE render_jobs SET execution_claimed_at = ? WHERE id = ?",
+            ("2000-01-01T00:00:00.000Z", render["id"]),
+        )
+    canceled_recovery = service.claim_next_resumable_render(lease_seconds=300)
+    assert canceled_recovery["id"] == render["id"]
+    assert service.is_render_cancel_requested(render["id"])
+    assert service.confirm_render_cancelled(render["id"])["status"] == "cancelled"
+
+
+def test_render_cancel_retry_and_eligibility_are_rechecked_at_claim_and_completion(tmp_path) -> None:
+    client, service, _ = _app(tmp_path)
+    client.app.state.domain_service = service
+    book, candidate, project, script, run = _ready_flow(client)
+    assert _approve(client, run["id"], script["id"]).status_code == 200
+    service.transition_run(run["id"], status="running", stage="storyboard")
+    render_body = {
+        "project_id": project["id"],
+        "script_version_id": script["id"],
+        "promotion_candidate_id": candidate["id"],
+        "width": 1080,
+        "height": 1920,
+        "asset_rights": [
+            {"origin": "self_created_graphic", "usage_status": "allowed"},
+            {"origin": "self_created_text", "usage_status": "allowed"},
+        ],
+    }
+
+    first = client.post(
+        "/api/v1/renders",
+        headers={"Idempotency-Key": "eligibility-claim-render"},
+        json=render_body,
+    ).json()
+    revoked = client.patch(
+        f"/api/v1/promotion-candidates/{candidate['id']}/eligibility",
+        json={
+            "eligibility_status": "unverified",
+            "expected_revision": 1,
+            "eligibility_note": None,
+            "confirmation_basis": None,
+        },
+    )
+    assert revoked.status_code == 200
+    assert service.claim_next_render() is None
+    assert service.get_render(first["id"])["status"] == "failed"
+
+    confirmed = client.patch(
+        f"/api/v1/promotion-candidates/{candidate['id']}/eligibility",
+        json={
+            "eligibility_status": "manually_confirmed",
+            "expected_revision": 2,
+            "eligibility_note": "虚构演示：重新人工核对",
+            "confirmation_basis": "creator_account_backend",
+        },
+    )
+    assert confirmed.status_code == 200
+    second = client.post(
+        "/api/v1/renders",
+        headers={"Idempotency-Key": "eligibility-complete-render"},
+        json=render_body,
+    ).json()
+    assert service.claim_next_render()["id"] == second["id"]
+    revoked_again = client.patch(
+        f"/api/v1/promotion-candidates/{candidate['id']}/eligibility",
+        json={
+            "eligibility_status": "unverified",
+            "expected_revision": 3,
+            "eligibility_note": None,
+            "confirmation_basis": None,
+        },
+    )
+    assert revoked_again.status_code == 200
+    output_path = service.render_output_dir / "cancel-check.mp4"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(b"fictional demo render bytes")
+    failed = service.complete_render(second["id"], str(output_path))
+    assert failed["status"] == "failed"
+    assert "manually confirmed" in failed["error_message"]
+    package = client.get(
+        f"/api/v1/creative-projects/{project['id']}/publication-package"
+    )
+    assert package.status_code == 404
+
+    re_confirmed = client.patch(
+        f"/api/v1/promotion-candidates/{candidate['id']}/eligibility",
+        json={
+            "eligibility_status": "manually_confirmed",
+            "expected_revision": 4,
+            "eligibility_note": "虚构演示：再次人工核对",
+            "confirmation_basis": "creator_account_backend",
+        },
+    )
+    assert re_confirmed.status_code == 200
+    third = client.post(
+        "/api/v1/renders",
+        headers={"Idempotency-Key": "cancel-running-render"},
+        json=render_body,
+    ).json()
+    assert service.claim_next_render()["id"] == third["id"]
+    canceled = client.post(
+        f"/api/v1/renders/{third['id']}/cancel",
+        headers={"Idempotency-Key": "render-cancel-action"},
+        json={"reason": "虚构演示：取消成片任务"},
+    )
+    assert canceled.status_code == 200
+    assert canceled.json()["status"] == "running"
+    assert canceled.json()["cancel_requested_at"] is not None
+    assert service.is_render_cancel_requested(third["id"])
+    blocked_complete = None
+    try:
+        service.complete_render(third["id"], str(output_path))
+    except Exception as error:
+        blocked_complete = error
+    assert getattr(blocked_complete, "code", None) == "invalid_state_transition"
+    canceled = service.confirm_render_cancelled(third["id"])
+    assert canceled["status"] == "cancelled"
+    retry = client.post(
+        f"/api/v1/renders/{second['id']}/retry",
+        headers={"Idempotency-Key": "retry-failed-render"},
+    )
+    assert retry.status_code == 202
+    assert retry.json()["id"] == second["id"]
+    assert retry.json()["attempt"] == 2
+    assert retry.json()["status"] == "queued"
+
+
+def test_w2_migration_backfills_legacy_payload_fields(tmp_path) -> None:
+    path = tmp_path / "legacy.sqlite3"
+    import sqlite3
+
+    conn = sqlite3.connect(path)
+    migration = Path(__file__).parents[2] / "migrations" / "001_initial.sql"
+    conn.executescript(migration.read_text(encoding="utf-8"))
+    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    conn.execute(
+        "INSERT INTO books(id, owner_user_id, created_at, payload) VALUES (?, ?, ?, ?)",
+        (
+            "00000000-0000-4000-8000-000000000101",
+            OWNER_ID,
+            now,
+            '{"id":"00000000-0000-4000-8000-000000000101","owner_user_id":"'
+            + OWNER_ID
+            + '","created_at":"'
+            + now
+            + '","title":"虛構","edition_label":"演示","author":"例","facts":[],"original_opinion":"虛構"}',
+        ),
+    )
+    conn.execute(
+        "INSERT INTO promotion_candidates(id, owner_user_id, book_id, created_at, payload) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (
+            "00000000-0000-4000-8000-000000000102",
+            OWNER_ID,
+            "00000000-0000-4000-8000-000000000101",
+            now,
+            '{"id":"00000000-0000-4000-8000-000000000102","owner_user_id":"'
+            + OWNER_ID
+            + '","book_id":"00000000-0000-4000-8000-000000000101","created_at":"'
+            + now
+            + '","eligibility_status":"unverified","eligibility_checked_at":null,"eligibility_note":null}',
+        ),
+    )
+    conn.execute(
+        "INSERT INTO creative_projects(id, owner_user_id, book_id, promotion_candidate_id, created_at, payload) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            "00000000-0000-4000-8000-000000000103",
+            OWNER_ID,
+            "00000000-0000-4000-8000-000000000101",
+            "00000000-0000-4000-8000-000000000102",
+            now,
+            '{"id":"00000000-0000-4000-8000-000000000103","owner_user_id":"'
+            + OWNER_ID
+            + '","book_id":"00000000-0000-4000-8000-000000000101","promotion_candidate_id":"00000000-0000-4000-8000-000000000102","created_at":"'
+            + now
+            + '"}',
+        ),
+    )
+    conn.execute(
+        "INSERT INTO runs(id, owner_user_id, project_id, brief_version, status, stage, sequence, "
+        "idempotency_key, request_hash, created_at, updated_at, payload) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "00000000-0000-4000-8000-000000000104",
+            OWNER_ID,
+            "00000000-0000-4000-8000-000000000103",
+            1,
+            "queued",
+            "prepare",
+            1,
+            "legacy-run-key",
+            "legacy-hash",
+            now,
+            now,
+            '{"id":"00000000-0000-4000-8000-000000000104","project_id":"00000000-0000-4000-8000-000000000103","owner_user_id":"'
+            + OWNER_ID
+            + '","status":"queued","stage":"prepare","sequence":1,"error_code":null,"error_message":null,"created_at":"'
+            + now
+            + '","updated_at":"'
+            + now
+            + '"}',
+        ),
+    )
+    conn.execute(
+        "INSERT INTO script_versions(id, owner_user_id, project_id, version_number, review_status, created_at, payload) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            "00000000-0000-4000-8000-000000000106",
+            OWNER_ID,
+            "00000000-0000-4000-8000-000000000103",
+            1,
+            "pending",
+            now,
+            '{"id":"00000000-0000-4000-8000-000000000106","project_id":"00000000-0000-4000-8000-000000000103","owner_user_id":"'
+            + OWNER_ID
+            + '","version_number":1,"review_status":"pending","created_at":"'
+            + now
+            + '","segments":[],"title_suggestion":"虛構","description_suggestion":"虛構"}',
+        ),
+    )
+    conn.execute(
+        "INSERT INTO render_jobs(id, owner_user_id, project_id, script_version_id, promotion_candidate_id, "
+        "status, idempotency_key, request_hash, asset_rights, created_at, updated_at, payload) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "00000000-0000-4000-8000-000000000105",
+            OWNER_ID,
+            "00000000-0000-4000-8000-000000000103",
+            "00000000-0000-4000-8000-000000000106",
+            "00000000-0000-4000-8000-000000000102",
+            "queued",
+            "legacy-render-key",
+            "legacy-hash",
+            "[]",
+            now,
+            now,
+            '{"id":"00000000-0000-4000-8000-000000000105","project_id":"00000000-0000-4000-8000-000000000103","script_version_id":"00000000-0000-4000-8000-000000000106","owner_user_id":"'
+            + OWNER_ID
+            + '","status":"queued","output_ref":null,"error_message":null,"created_at":"'
+            + now
+            + '"}',
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    reopened = DomainService(Database(path), owner_user_id=OWNER_ID)
+    candidate = reopened.get_promotion_candidate(
+        "00000000-0000-4000-8000-000000000102"
+    )
+    run = reopened.get_run("00000000-0000-4000-8000-000000000104")
+    render = reopened.get_render("00000000-0000-4000-8000-000000000105")
+    assert candidate["eligibility_revision"] == 1
+    assert candidate["eligibility_checked_by_user_id"] is None
+    assert run["attempt"] == 1
+    assert run["cancel_requested_at"] is None
+    assert render["attempt"] == 1
+    assert render["cancel_requested_at"] is None
+    assert render["updated_at"] == now
+
+
+def test_003_upgrades_database_where_original_002_is_already_applied(tmp_path) -> None:
+    import sqlite3
+
+    path = tmp_path / "applied-002.sqlite3"
+    migration_dir = Path(__file__).parents[2] / "migrations"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE schema_migrations (version TEXT PRIMARY KEY, applied_at TEXT NOT NULL)"
+    )
+    for version in ("001_initial", "002_w2_reliability"):
+        migration = migration_dir / f"{version}.sql"
+        conn.executescript(migration.read_text(encoding="utf-8"))
+        conn.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+            (version, "2026-10-29T00:00:00.000Z"),
+        )
+    conn.commit()
+    columns_before = {
+        row[1] for row in conn.execute("PRAGMA table_info(render_jobs)").fetchall()
+    }
+    assert "execution_claimed_at" not in columns_before
+    conn.close()
+
+    database = Database(path)
+    with database.read() as migrated:
+        columns_after = {
+            row[1] for row in migrated.execute("PRAGMA table_info(render_jobs)").fetchall()
+        }
+        indexes = {
+            row[1] for row in migrated.execute("PRAGMA index_list(render_jobs)").fetchall()
+        }
+        versions = [
+            row[0]
+            for row in migrated.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            ).fetchall()
+        ]
+    assert "execution_claimed_at" in columns_after
+    assert "idx_render_jobs_execution_lease" in indexes
+    assert versions == ["001_initial", "002_w2_reliability", "003_render_execution_lease"]
+    service = DomainService(database, owner_user_id=OWNER_ID)
+    assert service.claim_next_resumable_render() is None

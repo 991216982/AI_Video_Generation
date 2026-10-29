@@ -22,6 +22,7 @@ from book_video.media.rights import asset_rights_blockers
 
 EventSink = Callable[[Mapping[str, Any]], None]
 ScriptSink = Callable[[Mapping[str, Any]], None]
+CancelCheck = Callable[[], bool]
 
 SAFE_FACT_KEYS = {
     "title",
@@ -40,6 +41,10 @@ class ScriptGenerationError(ValueError):
 
 class ReviewGateError(ScriptGenerationError):
     """A requested approval did not satisfy the required human checks."""
+
+
+class WorkflowCancelledError(RuntimeError):
+    """The owning run has a persisted cancellation request."""
 
 
 class GenerationState(TypedDict, total=False):
@@ -62,6 +67,11 @@ _DEFAULT_CHECKPOINTER = MemorySaver()
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _check_cancelled(cancel_check: CancelCheck | None) -> None:
+    if cancel_check is not None and cancel_check():
+        raise WorkflowCancelledError("run cancellation was requested")
 
 
 def _verified_metadata_fact(book: Mapping[str, Any]) -> dict[str, str]:
@@ -507,6 +517,7 @@ def create_script_generation_graph(
     checkpointer: Any = None,
     emit_event: EventSink | None = None,
     persist_script: ScriptSink | None = None,
+    cancel_check: CancelCheck | None = None,
 ) -> Any:
     """Compile the generation graph with caller-provided integration hooks.
 
@@ -548,6 +559,7 @@ def create_script_generation_graph(
         return event
 
     def prepare(state: GenerationState) -> dict[str, Any]:
+        _check_cancelled(cancel_check)
         snapshot = _validate_snapshot(state["snapshot"], state["run_id"])
         project = snapshot["project"]
         run_snapshot = snapshot.get("run", {})
@@ -570,7 +582,11 @@ def create_script_generation_graph(
         }
 
     def generate(state: GenerationState) -> dict[str, Any]:
+        _check_cancelled(cancel_check)
         scripts = _make_scripts(state["snapshot"], state["run_id"])
+        # Check once after pure generation and before persistence begins. The
+        # domain sink still owns the final atomic cancellation guard.
+        _check_cancelled(cancel_check)
         for script in scripts:
             script_sink(script)
         sequence = state["event_sequence"] + 1
@@ -591,6 +607,7 @@ def create_script_generation_graph(
         }
 
     def fact_check(state: GenerationState) -> dict[str, Any]:
+        _check_cancelled(cancel_check)
         verified = _verified_fact_keys(state["snapshot"])
         for script in state["scripts"]:
             used = {str(key) for segment in script["segments"] for key in segment["fact_keys"]}
@@ -625,6 +642,7 @@ def create_script_generation_graph(
         }
 
     def review(state: GenerationState) -> dict[str, Any]:
+        _check_cancelled(cancel_check)
         requested_sequence = state["event_sequence"] + 1
         requested_event = append_event(
             state,
@@ -649,6 +667,7 @@ def create_script_generation_graph(
                 }
             )
         )
+        _check_cancelled(cancel_check)
         selected_id = decision["script_version_id"]
         selected = _resolve_review_script(state["snapshot"], state["scripts"], decision)
         if decision["decision"] == "approve":
@@ -774,7 +793,50 @@ def create_script_generation_graph(
     builder.add_edge("generate", "fact_check")
     builder.add_edge("fact_check", "review")
     builder.add_conditional_edges("review", after_review, {"review": "review", END: END})
-    return builder.compile(checkpointer=checkpointer or _DEFAULT_CHECKPOINTER)
+    return builder.compile(
+        checkpointer=checkpointer if checkpointer is not None else _DEFAULT_CHECKPOINTER
+    )
+
+
+def _public_checkpoint_state(graph: Any, run_id: str) -> dict[str, Any] | None:
+    """Read an existing run without re-running nodes or repeating side effects."""
+
+    state = graph.get_state({"configurable": {"thread_id": run_id}})
+    if not state.values:
+        return None
+    public = {key: value for key, value in state.values.items() if not key.startswith("__")}
+    if str(public.get("run_id", "")) != run_id:
+        raise ScriptGenerationError("checkpoint thread does not match the requested run")
+
+    interrupts = [
+        interrupt
+        for task in (state.tasks or ())
+        for interrupt in (getattr(task, "interrupts", ()) or ())
+    ]
+    if interrupts:
+        public["waiting_for_review"] = True
+        public["review_interrupt"] = interrupts[0].value
+        # The interrupting node has not returned its output yet, so expose its
+        # stable request event in the public state without emitting it again.
+        events = list(public.get("events", []))
+        current_sequence = int(public.get("event_sequence", 0))
+        request_sequence = current_sequence + 1
+        if not any(int(event.get("sequence", -1)) == request_sequence for event in events):
+            events.append(
+                _make_event(
+                    run_id=run_id,
+                    project_id=str(public.get("project_id", "")),
+                    sequence=request_sequence,
+                    event_type="run.review_requested",
+                    status="waiting_review",
+                    stage="review",
+                    message="请核对事实、拟挂商品与素材许可后选择一个脚本版本",
+                )
+            )
+            public["events"] = events
+    else:
+        public["waiting_for_review"] = public.get("status") == "waiting_review"
+    return public
 
 
 def run_script_generation(
@@ -785,6 +847,7 @@ def run_script_generation(
     emit_event: EventSink | None = None,
     persist_script: ScriptSink | None = None,
     review_decision: Mapping[str, Any] | None = None,
+    cancel_check: CancelCheck | None = None,
 ) -> dict[str, Any]:
     """Start a run or resume it with the decision returned by a human reviewer.
 
@@ -796,7 +859,26 @@ def run_script_generation(
 
     if not run_id.strip():
         raise ScriptGenerationError("run_id is required")
+    graph = create_script_generation_graph(
+        checkpointer=checkpointer,
+        emit_event=emit_event,
+        persist_script=persist_script,
+        cancel_check=cancel_check,
+    )
+
+    _check_cancelled(cancel_check)
     if review_decision is None:
+        recovered = _public_checkpoint_state(graph, run_id)
+        if recovered is not None:
+            if snapshot is not None:
+                stored_project = recovered.get("snapshot", {}).get("project", {})
+                supplied_project = snapshot.get("project", {})
+                for field in ("id", "owner_user_id"):
+                    if str(stored_project.get(field, "")) != str(supplied_project.get(field, "")):
+                        raise ScriptGenerationError(
+                            "checkpoint project or owner does not match the supplied run snapshot"
+                        )
+            return recovered
         if snapshot is None:
             raise ScriptGenerationError("snapshot is required to start a run")
         run_snapshot = snapshot.get("run", {})
@@ -813,11 +895,6 @@ def run_script_generation(
     else:
         initial_state = Command(resume=dict(review_decision))
 
-    graph = create_script_generation_graph(
-        checkpointer=checkpointer,
-        emit_event=emit_event,
-        persist_script=persist_script,
-    )
     result = graph.invoke(initial_state, config={"configurable": {"thread_id": run_id}})
     public = {key: value for key, value in result.items() if not key.startswith("__")}
     interrupts = result.get("__interrupt__", ())

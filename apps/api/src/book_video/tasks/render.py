@@ -4,17 +4,20 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 import threading
+import time
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence
-from uuid import NAMESPACE_URL, uuid5
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from book_video.media.ffmpeg import (
     HEIGHT,
     MAX_DURATION_SECONDS,
     MIN_DURATION_SECONDS,
+    MediaCancelledError,
     WIDTH,
     MediaDependencyError,
     MediaRenderError,
@@ -37,6 +40,8 @@ class IdempotencyStore(Protocol):
         key: str,
         fingerprint: str,
         operation: Callable[[], dict[str, Any]],
+        *,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> dict[str, Any]: ...
 
 
@@ -56,6 +61,8 @@ class InMemoryIdempotencyStore:
         key: str,
         fingerprint: str,
         operation: Callable[[], dict[str, Any]],
+        *,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         with self._condition:
             while True:
@@ -66,7 +73,9 @@ class InMemoryIdempotencyStore:
                 if record["fingerprint"] != fingerprint:
                     raise IdempotencyConflictError("idempotency key is already bound to a different request")
                 if record["state"] == "running":
-                    self._condition.wait()
+                    if cancel_check is not None and cancel_check():
+                        raise MediaCancelledError("render cancellation was requested")
+                    self._condition.wait(timeout=0.1 if cancel_check is not None else None)
                     continue
                 if record["state"] == "succeeded":
                     return deepcopy(record["result"])
@@ -91,6 +100,159 @@ class InMemoryIdempotencyStore:
 
 
 _DEFAULT_IDEMPOTENCY_STORE = InMemoryIdempotencyStore()
+
+
+class IdempotentRenderError(RuntimeError):
+    """A previous execution for this durable render attempt failed."""
+
+
+class SQLiteIdempotencyStore:
+    """Cross-process render idempotency with expiring worker leases.
+
+    A completed attempt reuses its serialized RenderJob result after restart.
+    If a worker exits without releasing its claim, another process can reclaim
+    the attempt after the lease expires. Retries use a new attempt number while
+    retaining the render ID and deterministic output path.
+    """
+
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        lease_seconds: float = 300.0,
+        poll_seconds: float = 0.05,
+        timeout_seconds: float = 30.0,
+    ) -> None:
+        if str(path) == ":memory:":
+            raise ValueError("SQLiteIdempotencyStore requires a file-backed database")
+        if lease_seconds <= 0 or poll_seconds <= 0 or timeout_seconds <= 0:
+            raise ValueError("lease_seconds, poll_seconds, and timeout_seconds must be positive")
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.lease_seconds = lease_seconds
+        self.poll_seconds = poll_seconds
+        self.timeout_seconds = timeout_seconds
+        with self._connect() as connection:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS render_idempotency ("
+                "key TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, state TEXT NOT NULL, "
+                "lease_token TEXT, lease_expires_at REAL, result_json TEXT, error_message TEXT)"
+            )
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.path, timeout=self.timeout_seconds)
+        connection.execute(f"PRAGMA busy_timeout={int(self.timeout_seconds * 1000)}")
+        return connection
+
+    def _renew_lease(self, key: str, token: str, stop: threading.Event) -> None:
+        interval = max(0.05, min(self.lease_seconds / 3, 30.0))
+        while not stop.wait(interval):
+            try:
+                with self._connect() as connection:
+                    connection.execute(
+                        "UPDATE render_idempotency SET lease_expires_at=? "
+                        "WHERE key=? AND state='running' AND lease_token=?",
+                        (time.time() + self.lease_seconds, key, token),
+                    )
+            except sqlite3.Error:
+                # Completion verifies the token so an expired lease cannot
+                # silently publish a result after another worker took over.
+                continue
+
+    def execute_once(
+        self,
+        key: str,
+        fingerprint: str,
+        operation: Callable[[], dict[str, Any]],
+        *,
+        cancel_check: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
+        token = uuid4().hex
+        claimed = False
+        while not claimed:
+            if cancel_check is not None and cancel_check():
+                raise MediaCancelledError("render cancellation was requested")
+            now = time.time()
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT fingerprint, state, lease_expires_at, result_json, error_message "
+                    "FROM render_idempotency WHERE key=?",
+                    (key,),
+                ).fetchone()
+                if row is None:
+                    connection.execute(
+                        "INSERT INTO render_idempotency "
+                        "(key, fingerprint, state, lease_token, lease_expires_at) "
+                        "VALUES (?, ?, 'running', ?, ?)",
+                        (key, fingerprint, token, now + self.lease_seconds),
+                    )
+                    claimed = True
+                else:
+                    existing_fingerprint, state, lease_expires_at, result_json, error_message = row
+                    if existing_fingerprint != fingerprint:
+                        raise IdempotencyConflictError(
+                            "idempotency key is already bound to a different render request"
+                        )
+                    if state == "succeeded":
+                        return json.loads(result_json)
+                    if state == "cancelled":
+                        raise MediaCancelledError(error_message or "render cancellation was requested")
+                    if state == "failed":
+                        raise IdempotentRenderError(error_message or "previous render attempt failed")
+                    if state != "running":
+                        raise IdempotentRenderError(f"unknown durable render state: {state}")
+                    if lease_expires_at is None or float(lease_expires_at) <= now:
+                        updated = connection.execute(
+                            "UPDATE render_idempotency SET lease_token=?, lease_expires_at=? "
+                            "WHERE key=? AND fingerprint=? AND state='running' AND lease_expires_at<=?",
+                            (token, now + self.lease_seconds, key, fingerprint, now),
+                        )
+                        claimed = updated.rowcount == 1
+                connection.commit()
+            if not claimed:
+                time.sleep(self.poll_seconds)
+
+        stop_heartbeat = threading.Event()
+        heartbeat = threading.Thread(
+            target=self._renew_lease,
+            args=(key, token, stop_heartbeat),
+            daemon=True,
+        )
+        heartbeat.start()
+        try:
+            result = operation()
+            result_json = json.dumps(result, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        except BaseException as error:
+            state = "cancelled" if isinstance(error, MediaCancelledError) else "failed"
+            with self._connect() as connection:
+                connection.execute(
+                    "UPDATE render_idempotency SET state=?, lease_token=NULL, lease_expires_at=NULL, "
+                    "error_message=? WHERE key=? AND state='running' AND lease_token=?",
+                    (state, str(error), key, token),
+                )
+            raise
+        finally:
+            stop_heartbeat.set()
+            heartbeat.join(timeout=1.0)
+
+        with self._connect() as connection:
+            updated = connection.execute(
+                "UPDATE render_idempotency SET state='succeeded', lease_token=NULL, "
+                "lease_expires_at=NULL, result_json=?, error_message=NULL "
+                "WHERE key=? AND state='running' AND lease_token=?",
+                (result_json, key, token),
+            )
+            if updated.rowcount != 1:
+                row = connection.execute(
+                    "SELECT state, result_json FROM render_idempotency WHERE key=? AND fingerprint=?",
+                    (key, fingerprint),
+                ).fetchone()
+                if row and row[0] == "succeeded":
+                    return json.loads(row[1])
+                raise IdempotentRenderError("render idempotency lease was lost before completion")
+        return result
 
 
 def _timestamp() -> str:
@@ -171,8 +333,10 @@ def run_render_task(
     *,
     idempotency_key: str,
     output_dir: str | Path,
+    attempt: int | None = None,
     idempotency_store: IdempotencyStore | None = None,
     renderer: Callable[..., dict[str, Any]] = render_mp4,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Render an approved snapshot once and return RenderJob-shaped metadata.
 
@@ -186,12 +350,38 @@ def run_render_task(
         raise RenderSnapshotError("idempotency_key must contain 8 to 128 characters")
     normalized, duration = _validate_snapshot(snapshot)
     store = idempotency_store or _DEFAULT_IDEMPOTENCY_STORE
-    request_fingerprint = _fingerprint(normalized)
+    render_snapshot = normalized.get("render", {})
+    if attempt is None:
+        attempt = render_snapshot.get("attempt", 1) if isinstance(render_snapshot, Mapping) else 1
+    if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+        raise RenderSnapshotError("attempt must be a positive integer")
+    immutable_input = {
+        key: normalized.get(key)
+        for key in (
+            "project",
+            "book",
+            "promotion_candidate",
+            "script_version",
+            "asset_rights",
+            "width",
+            "height",
+        )
+    }
+    request_fingerprint = _fingerprint(immutable_input)
     render_token = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()[:24]
     render_id = str(uuid5(NAMESPACE_URL, f"book-video:render:{idempotency_key}"))
     output_path = Path(output_dir) / f"render-{render_token}.mp4"
+    attempt_key = f"{idempotency_key}:attempt:{attempt}"
+
+    def check_cancelled() -> None:
+        if cancel_check is not None and cancel_check():
+            raise MediaCancelledError("render cancellation was requested")
 
     def operation() -> dict[str, Any]:
+        check_cancelled()
+        # A retry retains the render ID and output path. Remove any incomplete
+        # file left by a failed prior attempt before starting the next one.
+        output_path.unlink(missing_ok=True)
         base = {
             "id": render_id,
             "project_id": str(normalized["project"]["id"]),
@@ -206,14 +396,24 @@ def run_render_task(
                 output_path=output_path,
                 width=normalized.get("width", WIDTH),
                 height=normalized.get("height", HEIGHT),
+                cancel_check=cancel_check,
             )
+        except MediaCancelledError:
+            output_path.unlink(missing_ok=True)
+            raise
         except (MediaDependencyError, MediaRenderError) as error:
+            output_path.unlink(missing_ok=True)
             return {
                 **base,
                 "status": "failed",
                 "output_ref": None,
                 "error_message": str(error),
             }
+        try:
+            check_cancelled()
+        except MediaCancelledError:
+            output_path.unlink(missing_ok=True)
+            raise
         return {
             **base,
             "status": "succeeded",
@@ -222,4 +422,10 @@ def run_render_task(
             "media": metadata,
         }
 
-    return store.execute_once(idempotency_key, request_fingerprint, operation)
+    check_cancelled()
+    return store.execute_once(
+        attempt_key,
+        request_fingerprint,
+        operation,
+        cancel_check=cancel_check,
+    )

@@ -1,4 +1,4 @@
-"""Single-user development worker polling the SQLite task queue."""
+"""Single-user worker polling durable run, review, and render queues."""
 
 import argparse
 import time
@@ -13,16 +13,18 @@ def main() -> None:
     parser.add_argument("--poll-interval", type=float, default=0.5)
     args = parser.parse_args()
     service = DomainService()
-    print("worker ready", flush=True)
-    if args.once:
-        process_one(service)
-        return
     try:
+        print("worker ready", flush=True)
+        if args.once:
+            process_one(service)
+            return
         while True:
             if not process_one(service):
                 time.sleep(args.poll_interval)
     except KeyboardInterrupt:
         pass
+    finally:
+        service.database.close()
 
 
 if __name__ == "__main__":

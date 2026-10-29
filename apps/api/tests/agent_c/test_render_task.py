@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from copy import deepcopy
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 from typing import Any
 
@@ -12,9 +15,11 @@ from book_video.media.ffmpeg import MediaDependencyError, render_mp4
 from book_video.tasks.render import (
     IdempotencyConflictError,
     InMemoryIdempotencyStore,
+    SQLiteIdempotencyStore,
     RenderSnapshotError,
     run_render_task,
 )
+from book_video.media.ffmpeg import MediaCancelledError, MediaRenderError, probe_mp4
 
 
 PROJECT_ID = "20000000-0000-4000-8000-000000000001"
@@ -101,6 +106,163 @@ def test_render_task_reuses_same_result_for_idempotency_key(tmp_path: Path) -> N
     assert first["status"] == "succeeded"
     assert first["output_ref"].endswith(".mp4")
     assert len(calls) == 1
+
+
+def test_sqlite_store_survives_process_restart_and_attempt_retry_keeps_render_id(tmp_path: Path) -> None:
+    database_path = tmp_path / "render-idempotency.sqlite3"
+    output_dir = tmp_path / "renders"
+    calls: list[int] = []
+
+    def failing_renderer(_segments: Any, **_kwargs: Any) -> dict[str, Any]:
+        calls.append(1)
+        raise MediaRenderError("演示的可重试渲染失败")
+
+    failed = run_render_task(
+        render_snapshot(),
+        idempotency_key="demo-render-retry-001",
+        attempt=1,
+        output_dir=output_dir,
+        idempotency_store=SQLiteIdempotencyStore(database_path),
+        renderer=failing_renderer,
+    )
+    assert failed["status"] == "failed"
+
+    def successful_renderer(_segments: Any, **kwargs: Any) -> dict[str, Any]:
+        calls.append(2)
+        Path(kwargs["output_path"]).parent.mkdir(parents=True, exist_ok=True)
+        Path(kwargs["output_path"]).write_bytes(b"demo mp4 output")
+        return {
+            "container": "mp4",
+            "video_codec": "h264",
+            "width": 1080,
+            "height": 1920,
+            "duration_seconds": 30.0,
+            "audio_present": False,
+        }
+
+    retried = run_render_task(
+        render_snapshot(),
+        idempotency_key="demo-render-retry-001",
+        attempt=2,
+        output_dir=output_dir,
+        idempotency_store=SQLiteIdempotencyStore(database_path),
+        renderer=successful_renderer,
+    )
+    assert retried["status"] == "succeeded"
+    assert retried["id"] == failed["id"]
+    assert Path(retried["output_ref"]).is_file()
+    assert calls == [1, 2]
+
+    child_code = r'''
+import json
+import sys
+from book_video.media.ffmpeg import MediaRenderError
+from book_video.tasks.render import SQLiteIdempotencyStore, run_render_task
+
+request = json.loads(sys.stdin.read())
+def should_not_render(*args, **kwargs):
+    raise RuntimeError("completed durable render should be reused")
+result = run_render_task(
+    request["snapshot"],
+    idempotency_key=request["idempotency_key"],
+    attempt=request["attempt"],
+    output_dir=request["output_dir"],
+    idempotency_store=SQLiteIdempotencyStore(request["database_path"]),
+    renderer=should_not_render,
+)
+print(json.dumps(result, ensure_ascii=True))
+'''
+    api_src = Path(__file__).resolve().parents[2] / "src"
+    env = dict(os.environ)
+    existing_pythonpath = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = str(api_src) + (os.pathsep + existing_pythonpath if existing_pythonpath else "")
+    completed = subprocess.run(
+        [sys.executable, "-c", child_code],
+        input=json.dumps(
+            {
+                "snapshot": render_snapshot(),
+                "idempotency_key": "demo-render-retry-001",
+                "attempt": 2,
+                "output_dir": str(output_dir),
+                "database_path": str(database_path),
+            },
+            ensure_ascii=True,
+        ),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env=env,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    recovered = json.loads(completed.stdout)
+    assert recovered == retried
+    assert calls == [1, 2]
+
+
+def test_render_cancellation_removes_partial_output(tmp_path: Path) -> None:
+    cancelled = [False]
+
+    def fake_renderer(_segments: Any, **kwargs: Any) -> dict[str, Any]:
+        Path(kwargs["output_path"]).write_bytes(b"partial demo output")
+        cancelled[0] = True
+        return {"duration_seconds": 30.0}
+
+    with pytest.raises(MediaCancelledError, match="cancellation"):
+        run_render_task(
+            render_snapshot(),
+            idempotency_key="demo-render-cancel-001",
+            output_dir=tmp_path,
+            idempotency_store=InMemoryIdempotencyStore(),
+            renderer=fake_renderer,
+            cancel_check=lambda: cancelled[0],
+        )
+    assert list(tmp_path.glob("render-*.mp4")) == []
+
+
+def test_media_cancellation_terminates_encoder_process(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from book_video.media import ffmpeg as ffmpeg_module
+
+    font = tmp_path / "fake-font.ttc"
+    font.write_bytes(b"test font placeholder")
+    monkeypatch.setattr(ffmpeg_module, "_find_font", lambda _font_path=None: font)
+
+    class SlowProcess:
+        returncode: int | None = None
+        terminated = False
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+            if self.returncode is None and timeout is not None:
+                raise subprocess.TimeoutExpired("ffmpeg", timeout)
+            return "", ""
+
+        def terminate(self) -> None:
+            self.terminated = True
+            self.returncode = -15
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+    process = SlowProcess()
+    monkeypatch.setattr(ffmpeg_module.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    checks = iter((False, True))
+    with pytest.raises(MediaCancelledError, match="cancellation"):
+        render_mp4(
+            render_snapshot()["script_version"]["segments"],
+            duration_seconds=30,
+            output_path=tmp_path / "cancelled.mp4",
+            ffmpeg_path="ffmpeg",
+            ffprobe_path="ffprobe",
+            font_path=font,
+            cancel_check=lambda: next(checks),
+        )
+    assert process.terminated is True
+    assert not (tmp_path / "cancelled.mp4").exists()
 
 
 def test_idempotency_key_cannot_be_reused_for_a_different_request(tmp_path: Path) -> None:
@@ -238,6 +400,27 @@ def test_local_renderer_uses_generated_graphics_and_emits_silent_mp4(
     assert metadata["height"] == 1920
     assert metadata["audio_present"] is False
     assert output.is_file()
+
+
+def test_ffprobe_accepts_real_generated_mp4_without_skip(tmp_path: Path) -> None:
+    snapshot = render_snapshot()
+    snapshot["project"]["desired_seconds"] = 20
+    segments = deepcopy(snapshot["script_version"]["segments"])
+    for segment, duration in zip(segments, (4.0, 4.4, 7.6, 4.0)):
+        segment["duration_seconds"] = duration
+    output = tmp_path / "actual-demo.mp4"
+    rendered = render_mp4(
+        segments,
+        duration_seconds=20,
+        output_path=output,
+    )
+    checked = probe_mp4(output)
+    assert rendered["container"] == "mp4"
+    assert rendered["video_codec"] == "h264"
+    assert rendered["width"] == checked["width"] == 1080
+    assert rendered["height"] == checked["height"] == 1920
+    assert 20 <= checked["duration_seconds"] <= 45
+    assert rendered["audio_present"] is checked["audio_present"] is False
 
 
 def test_render_mp4_reports_missing_ffmpeg(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

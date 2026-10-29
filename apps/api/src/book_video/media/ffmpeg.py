@@ -8,7 +8,8 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from types import SimpleNamespace
+from typing import Any, Callable, Mapping, Sequence
 
 
 WIDTH = 1080
@@ -24,6 +25,37 @@ class MediaDependencyError(RuntimeError):
 
 class MediaRenderError(RuntimeError):
     """FFmpeg failed or generated media did not satisfy the quality gate."""
+
+
+class MediaCancelledError(RuntimeError):
+    """The owning render received a persisted cancellation request."""
+
+
+def _check_cancelled(cancel_check: Callable[[], bool] | None) -> None:
+    if cancel_check is not None and cancel_check():
+        raise MediaCancelledError("render cancellation was requested")
+
+
+def _run_ffmpeg(command: list[str], cancel_check: Callable[[], bool] | None) -> Any:
+    if cancel_check is None:
+        return subprocess.run(command, check=False, capture_output=True, text=True)
+
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    while True:
+        if cancel_check():
+            if process.poll() is None:
+                process.terminate()
+            try:
+                process.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+            raise MediaCancelledError("render cancellation was requested")
+        try:
+            stdout, stderr = process.communicate(timeout=0.1)
+            return SimpleNamespace(returncode=process.returncode, stdout=stdout, stderr=stderr)
+        except subprocess.TimeoutExpired:
+            continue
 
 
 def _find_font(font_path: str | Path | None = None) -> Path:
@@ -165,6 +197,7 @@ def render_mp4(
     ffmpeg_path: str | None = None,
     ffprobe_path: str | None = None,
     font_path: str | Path | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Render only supplied script text plus generated geometric shapes.
 
@@ -172,6 +205,7 @@ def render_mp4(
     book-cover path is accepted by this function.
     """
 
+    _check_cancelled(cancel_check)
     if width != WIDTH or height != HEIGHT:
         raise MediaRenderError(f"only {WIDTH}x{HEIGHT} output is supported")
     if not MIN_DURATION_SECONDS <= duration_seconds <= MAX_DURATION_SECONDS:
@@ -229,21 +263,33 @@ def render_mp4(
             str(duration_seconds),
             str(temporary_output),
         ]
-        completed = subprocess.run(command, check=False, capture_output=True, text=True)
+        completed = _run_ffmpeg(command, cancel_check)
         if completed.returncode != 0:
             raise MediaRenderError(f"ffmpeg failed: {completed.stderr.strip() or completed.returncode}")
         if not temporary_output.is_file() or temporary_output.stat().st_size == 0:
             raise MediaRenderError("ffmpeg completed without creating an MP4")
+        _check_cancelled(cancel_check)
         os.replace(temporary_output, destination)
 
-    metadata = probe_mp4(
-        destination,
-        ffprobe_path=ffprobe_path,
-        expected_width=width,
-        expected_height=height,
-        minimum_duration=MIN_DURATION_SECONDS,
-        maximum_duration=MAX_DURATION_SECONDS,
-    )
+    try:
+        _check_cancelled(cancel_check)
+    except MediaCancelledError:
+        destination.unlink(missing_ok=True)
+        raise
+
+    try:
+        metadata = probe_mp4(
+            destination,
+            ffprobe_path=ffprobe_path,
+            expected_width=width,
+            expected_height=height,
+            minimum_duration=MIN_DURATION_SECONDS,
+            maximum_duration=MAX_DURATION_SECONDS,
+        )
+        _check_cancelled(cancel_check)
+    except MediaCancelledError:
+        destination.unlink(missing_ok=True)
+        raise
     if metadata["audio_present"]:
         raise MediaRenderError("output unexpectedly contains audio; silent rendering is required")
     metadata["asset_origins"] = ["self_created_text", "self_created_graphic"]

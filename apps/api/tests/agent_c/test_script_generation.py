@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
 from typing import Any
 
 import pytest
@@ -9,8 +14,10 @@ from langgraph.checkpoint.memory import MemorySaver
 from book_video.workflows.script_generation import (
     ReviewGateError,
     ScriptGenerationError,
+    WorkflowCancelledError,
     run_script_generation,
 )
+from book_video.workflows.checkpoint import SQLiteCheckpointSaver
 
 
 RUN_ID = "10000000-0000-4000-8000-000000000001"
@@ -281,3 +288,117 @@ def test_review_blocks_edits_with_unverified_facts_and_rejects_unrelated_base() 
                 "asset_rights_confirmed": True,
             },
         )
+
+
+def test_waiting_review_checkpoint_recovers_and_resumes_in_a_new_process(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "workflow-checkpoints.sqlite3"
+    events: list[dict[str, Any]] = []
+    persisted: dict[str, dict[str, Any]] = {}
+    checkpointer = SQLiteCheckpointSaver(checkpoint_path)
+
+    def emit(event: Any) -> None:
+        events.append(deepcopy(dict(event)))
+
+    def persist(script: Any) -> None:
+        persisted[str(script["id"])] = deepcopy(dict(script))
+
+    paused = run_script_generation(
+        generation_snapshot(),
+        run_id=RUN_ID,
+        checkpointer=checkpointer,
+        emit_event=emit,
+        persist_script=persist,
+    )
+    assert paused["status"] == "waiting_review"
+    assert paused["waiting_for_review"] is True
+    original_script_ids = {str(script["id"]) for script in paused["scripts"]}
+    original_event_ids = {str(event["event_id"]) for event in events}
+
+    # Reopening the saver and starting the same run must read its pause point,
+    # not rerun script generation or append another event/script side effect.
+    recovered_events: list[dict[str, Any]] = []
+    recovered_scripts: list[dict[str, Any]] = []
+    recovered = run_script_generation(
+        generation_snapshot(),
+        run_id=RUN_ID,
+        checkpointer=SQLiteCheckpointSaver(checkpoint_path),
+        emit_event=recovered_events.append,
+        persist_script=recovered_scripts.append,
+    )
+    assert recovered["status"] == "waiting_review"
+    assert recovered["waiting_for_review"] is True
+    assert [script["id"] for script in recovered["scripts"]] == [script["id"] for script in paused["scripts"]]
+    assert recovered_events == []
+    assert recovered_scripts == []
+
+    decision = {
+        "script_version_id": paused["scripts"][0]["id"],
+        "decision": "approve",
+        "fact_confirmed": True,
+        "product_match_confirmed": True,
+        "asset_rights_confirmed": True,
+    }
+    child_code = r'''
+import json
+import sys
+from book_video.workflows.checkpoint import SQLiteCheckpointSaver
+from book_video.workflows.script_generation import run_script_generation
+
+request = json.loads(sys.stdin.read())
+events = []
+scripts = []
+state = run_script_generation(
+    None,
+    run_id=request["run_id"],
+    checkpointer=SQLiteCheckpointSaver(request["checkpoint_path"]),
+    review_decision=request["decision"],
+    emit_event=events.append,
+    persist_script=scripts.append,
+)
+print(json.dumps({"state": state, "events": events, "scripts": scripts}, ensure_ascii=True))
+'''
+    api_src = Path(__file__).resolve().parents[2] / "src"
+    env = dict(os.environ)
+    existing_pythonpath = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = str(api_src) + (os.pathsep + existing_pythonpath if existing_pythonpath else "")
+    completed = subprocess.run(
+        [sys.executable, "-c", child_code],
+        input=json.dumps(
+            {
+                "run_id": RUN_ID,
+                "checkpoint_path": str(checkpoint_path),
+                "decision": decision,
+            },
+            ensure_ascii=True,
+        ),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env=env,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    resumed = json.loads(completed.stdout)
+    assert resumed["state"]["status"] == "succeeded"
+    assert resumed["state"]["approved_script_version_id"] == decision["script_version_id"]
+    assert {str(script["id"]) for script in resumed["scripts"]} <= original_script_ids
+    resumed_event_ids = {str(event["event_id"]) for event in resumed["events"]}
+    assert len(resumed["events"]) == len(resumed_event_ids) == 3
+    assert len(original_event_ids & resumed_event_ids) == 1  # stable review-request event ID
+    assert len(original_event_ids | resumed_event_ids) == len(original_event_ids) + 2
+    assert len(persisted) == 2
+    assert all(script["review_status"] == "pending" for script in persisted.values())
+    assert resumed["scripts"][0]["review_status"] == "approved"
+
+
+def test_cancellation_before_script_persistence_prevents_generated_scripts() -> None:
+    persisted: list[dict[str, Any]] = []
+    with pytest.raises(WorkflowCancelledError):
+        run_script_generation(
+            generation_snapshot(),
+            run_id=RUN_ID,
+            checkpointer=MemorySaver(),
+            persist_script=persisted.append,
+            cancel_check=lambda: True,
+        )
+    assert persisted == []

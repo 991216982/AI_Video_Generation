@@ -33,7 +33,9 @@ class RunEventType(str, Enum):
     REVIEWED = "run.reviewed"
     FAILED = "run.failed"
     COMPLETED = "run.completed"
+    CANCEL_REQUESTED = "run.cancel_requested"
     CANCELLED = "run.cancelled"
+    RETRY_REQUESTED = "run.retry_requested"
 
 
 ALLOWED_RUN_TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
@@ -65,7 +67,7 @@ def validate_run_transition(current: str, target: str) -> None:
         return
     if target_status not in ALLOWED_RUN_TRANSITIONS[current_status]:
         raise conflict(
-            "invalid_run_transition",
+            "invalid_state_transition",
             f"Run status cannot move from {current_status.value} to {target_status.value}",
             current_status=current_status.value,
             target_status=target_status.value,
@@ -80,7 +82,7 @@ RENDER_TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
         {RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.CANCELLED}
     ),
     RunStatus.WAITING_REVIEW: frozenset(),
-    RunStatus.FAILED: frozenset(),
+    RunStatus.FAILED: frozenset({RunStatus.QUEUED}),
     RunStatus.SUCCEEDED: frozenset(),
     RunStatus.CANCELLED: frozenset(),
 }
@@ -96,7 +98,7 @@ def validate_render_transition(current: str, target: str) -> None:
         return
     if target_status not in RENDER_TRANSITIONS[current_status]:
         raise conflict(
-            "invalid_render_transition",
+            "invalid_state_transition",
             f"Render status cannot move from {current_status.value} to {target_status.value}",
             current_status=current_status.value,
             target_status=target_status.value,

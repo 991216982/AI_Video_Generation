@@ -1,20 +1,22 @@
-"""Stage 1 adapter between the owner-scoped domain and the generation worker.
-
-Run events and generated scripts are persisted by DomainService. The LangGraph
-checkpointer is process-local for the first single-user pilot; the worker must
-stay alive while a run waits for human review.
-"""
+"""Owner-scoped domain, durable workflow, and render worker integration."""
 
 from __future__ import annotations
 
 import logging
+import hashlib
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Mapping
 from uuid import NAMESPACE_URL, uuid5
 
 from book_video.domain.service import DomainService
-from book_video.tasks import run_render_task
-from book_video.workflows import run_script_generation
+from book_video.tasks import MediaCancelledError, SQLiteIdempotencyStore, run_render_task
+from book_video.workflows import (
+    SQLiteCheckpointSaver,
+    WorkflowCancelledError,
+    create_script_generation_graph,
+    run_script_generation,
+)
 
 
 log = logging.getLogger(__name__)
@@ -68,12 +70,74 @@ def _script_adapter(service: DomainService, project_id: str):
     return persist
 
 
+def _checkpoint_saver(service: DomainService) -> SQLiteCheckpointSaver:
+    """Keep checkpoints with the domain database across worker processes."""
+
+    return SQLiteCheckpointSaver(service.database.path)
+
+
+def _render_store(service: DomainService) -> SQLiteIdempotencyStore:
+    return SQLiteIdempotencyStore(service.database.path)
+
+
+def _finish_run_error(service: DomainService, run_id: str, error: Exception, code: str) -> None:
+    current = service.get_run(run_id)
+    if current["status"] in {"succeeded", "failed", "cancelled"}:
+        return
+    if current.get("cancel_requested_at"):
+        service.confirm_run_cancelled(run_id, str(error))
+        return
+    service.transition_run(
+        run_id, status="failed", event_type="run.failed", reason_code=code, message=str(error)
+    )
+
+
+def _discard_unpublished_output(service: DomainService, result: Mapping[str, Any] | None) -> None:
+    """Remove an MP4 that must not remain as a valid completed render."""
+
+    if not result or not result.get("output_ref"):
+        return
+    root = service.render_output_dir.resolve()
+    output = Path(str(result["output_ref"])).resolve()
+    if output.is_relative_to(root):
+        output.unlink(missing_ok=True)
+
+
+def _discard_partial_render(service: DomainService, render_id: str) -> None:
+    """Clean up a crashed render that was cancelled before task re-entry."""
+
+    token = hashlib.sha256(render_id.encode("utf-8")).hexdigest()[:24]
+    try:
+        (service.render_output_dir / f"render-{token}.mp4").unlink(missing_ok=True)
+    except OSError:
+        log.warning("partial media for cancelled render %s could not be removed", render_id)
+
+
+def _finish_render_error(
+    service: DomainService, render_id: str, error: Exception, result: Mapping[str, Any] | None = None
+) -> None:
+    current = service.get_render(render_id)
+    if current["status"] in {"succeeded", "failed", "cancelled"}:
+        return
+    if current.get("cancel_requested_at"):
+        service.confirm_render_cancelled(render_id)
+        _discard_unpublished_output(service, result)
+        _discard_partial_render(service, render_id)
+        return
+    service.fail_render(render_id, str(error))
+
+
 def process_queued_run(service: DomainService) -> bool:
     run = service.claim_next_run()
     if run is None:
         return False
     run_id, project_id = run["id"], run["project_id"]
     try:
+        saver = _checkpoint_saver(service)
+        if run["attempt"] > 1:
+            # A retry is a new attempt of the same domain run. Keep its event
+            # history, but do not resume the failed attempt's graph state.
+            saver.delete_thread(run_id)
         bundle = service.get_run_snapshot(run_id)
         snapshot = dict(bundle["snapshot"])
         snapshot["run"] = run
@@ -81,12 +145,62 @@ def process_queued_run(service: DomainService) -> bool:
         run_script_generation(
             snapshot,
             run_id=run_id,
+            checkpointer=saver,
             emit_event=_event_adapter(service, run_id, resuming=False),
             persist_script=_script_adapter(service, project_id),
+            cancel_check=lambda: service.is_run_cancel_requested(run_id),
         )
+    except WorkflowCancelledError as error:
+        service.confirm_run_cancelled(run_id, str(error))
     except Exception as error:
         log.exception("run %s failed", run_id)
-        service.transition_run(run_id, status="failed", event_type="run.failed", reason_code="generation_failed", message=str(error))
+        _finish_run_error(service, run_id, error, "generation_failed")
+    return True
+
+
+def process_resumable_run(service: DomainService) -> bool:
+    """Reclaim an interrupted non-review graph after its worker lease expires."""
+
+    run = service.claim_next_resumable_run()
+    if run is None:
+        return False
+    run_id, project_id = run["id"], run["project_id"]
+    try:
+        if service.is_run_cancel_requested(run_id):
+            service.confirm_run_cancelled(run_id, "Worker recovered a cancelled run")
+            return True
+        saver = _checkpoint_saver(service)
+        config = {"configurable": {"thread_id": run_id}}
+        if saver.get_tuple(config) is None:
+            bundle = service.get_run_snapshot(run_id)
+            snapshot = dict(bundle["snapshot"])
+            snapshot["run"] = service.get_run(run_id)
+            snapshot["asset_rights"] = SELF_CREATED_RIGHTS
+            run_script_generation(
+                snapshot,
+                run_id=run_id,
+                checkpointer=saver,
+                emit_event=_event_adapter(service, run_id, resuming=False),
+                persist_script=_script_adapter(service, project_id),
+                cancel_check=lambda: service.is_run_cancel_requested(run_id),
+            )
+        else:
+            graph = create_script_generation_graph(
+                checkpointer=saver,
+                emit_event=_event_adapter(service, run_id, resuming=False),
+                persist_script=_script_adapter(service, project_id),
+                cancel_check=lambda: service.is_run_cancel_requested(run_id),
+            )
+            graph.invoke(None, config=config)
+        if service.get_run(run_id)["status"] == "running":
+            raise RuntimeError("Recovered graph made no persisted state transition")
+    except WorkflowCancelledError as error:
+        service.confirm_run_cancelled(run_id, str(error))
+    except Exception as error:
+        log.exception("run %s recovery failed", run_id)
+        _finish_run_error(service, run_id, error, "generation_recovery_failed")
+    finally:
+        service.release_run_execution_claim(run_id)
     return True
 
 
@@ -96,41 +210,92 @@ def process_reviewed_run(service: DomainService) -> bool:
         return False
     run_id, project_id = run["id"], run["project_id"]
     try:
+        if service.is_run_cancel_requested(run_id):
+            service.confirm_run_cancelled(run_id, "Worker recovered a cancelled review")
+            return True
+        saver = _checkpoint_saver(service)
+        config = {"configurable": {"thread_id": run_id}}
+        if saver.get_tuple(config) is None:
+            raise RuntimeError("Durable review checkpoint is unavailable")
+        # The candidate may have been manually confirmed or withdrawn while
+        # the graph was paused. The review gate must see the current record.
+        graph = create_script_generation_graph(checkpointer=saver)
+        state = graph.get_state(config)
+        snapshot = dict(state.values["snapshot"])
+        candidate_id = snapshot["promotion_candidate"]["id"]
+        snapshot["promotion_candidate"] = service.get_promotion_candidate(candidate_id)
+        graph.update_state(config, {"snapshot": snapshot})
         decision = dict(service.get_review_request(run_id))
         decision["script_version"] = service.get_script_version(decision["script_version_id"])
-        run_script_generation(
+        result = run_script_generation(
             None,
             run_id=run_id,
+            checkpointer=saver,
             review_decision=decision,
             emit_event=_event_adapter(service, run_id, resuming=True),
             persist_script=_script_adapter(service, project_id),
+            cancel_check=lambda: service.is_run_cancel_requested(run_id),
         )
+        if result.get("waiting_for_review") or result.get("review_gate_error"):
+            raise RuntimeError("Review decision did not pass the current eligibility gate")
+    except WorkflowCancelledError as error:
+        service.confirm_run_cancelled(run_id, str(error))
     except Exception as error:
         log.exception("review resume for run %s failed", run_id)
-        service.transition_run(run_id, status="failed", event_type="run.failed", reason_code="review_resume_failed", message=str(error))
+        _finish_run_error(service, run_id, error, "review_resume_failed")
     return True
 
 
-def process_queued_render(service: DomainService) -> bool:
-    render = service.claim_next_render()
-    if render is None:
-        return False
+def _process_claimed_render(service: DomainService, render: Mapping[str, Any]) -> None:
     render_id = render["id"]
+    result: Mapping[str, Any] | None = None
     try:
+        if service.is_render_cancel_requested(render_id):
+            service.confirm_render_cancelled(render_id)
+            _discard_partial_render(service, render_id)
+            return
         snapshot = service.get_render_snapshot(render_id)
         snapshot["width"], snapshot["height"] = 1080, 1920
         result = run_render_task(
             snapshot,
             idempotency_key=render_id,
             output_dir=service.render_output_dir,
+            attempt=render["attempt"],
+            idempotency_store=_render_store(service),
+            cancel_check=lambda: service.is_render_cancel_requested(render_id),
         )
         if result["status"] == "succeeded":
-            service.complete_render(render_id, result["output_ref"])
+            completed = service.complete_render(render_id, result["output_ref"])
+            if completed["status"] != "succeeded":
+                _discard_unpublished_output(service, result)
         else:
             service.fail_render(render_id, result.get("error_message") or "Render failed")
+    except MediaCancelledError:
+        service.confirm_render_cancelled(render_id)
+        _discard_unpublished_output(service, result)
+        _discard_partial_render(service, render_id)
     except Exception as error:
         log.exception("render %s failed", render_id)
-        service.fail_render(render_id, str(error))
+        _finish_render_error(service, render_id, error, result)
+    finally:
+        service.release_render_execution_claim(render_id)
+
+
+def process_queued_render(service: DomainService) -> bool:
+    render = service.claim_next_render()
+    if render is None:
+        return False
+    _process_claimed_render(service, render)
+    return True
+
+
+def process_resumable_render(service: DomainService) -> bool:
+    """Reclaim a render left running by an exited worker."""
+
+    render = service.claim_next_resumable_render()
+    if render is None:
+        return False
+    _process_claimed_render(service, render)
     return True
 
 
@@ -140,5 +305,7 @@ def process_one(service: DomainService) -> bool:
     return (
         process_reviewed_run(service)
         or process_queued_run(service)
+        or process_resumable_run(service)
         or process_queued_render(service)
+        or process_resumable_render(service)
     )

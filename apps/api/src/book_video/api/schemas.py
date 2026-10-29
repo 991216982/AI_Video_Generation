@@ -51,6 +51,11 @@ class BookEdition(BookCreate):
     created_at: datetime
 
 
+class BookPage(StrictModel):
+    items: list[BookEdition]
+    next_cursor: str | None
+
+
 class EligibilityStatus(str, Enum):
     UNVERIFIED = "unverified"
     MANUALLY_CONFIRMED = "manually_confirmed"
@@ -92,6 +97,26 @@ class PromotionCandidate(PromotionCandidateCreate):
     id: UUID
     owner_user_id: UUID
     created_at: datetime
+    eligibility_revision: int = Field(ge=1)
+    eligibility_checked_by_user_id: UUID | None
+
+
+class PromotionEligibilityUpdate(StrictModel):
+    eligibility_status: EligibilityStatus
+    expected_revision: int = Field(ge=1)
+    eligibility_note: str | None = Field(max_length=500)
+    confirmation_basis: Literal["creator_account_backend"] | None
+
+    @model_validator(mode="after")
+    def match_manual_confirmation_fields(self) -> PromotionEligibilityUpdate:
+        if self.eligibility_status == EligibilityStatus.MANUALLY_CONFIRMED:
+            if not self.eligibility_note or self.confirmation_basis != "creator_account_backend":
+                raise ValueError(
+                    "manual confirmation requires a note and creator_account_backend basis"
+                )
+        elif self.confirmation_basis is not None:
+            raise ValueError("unverified eligibility cannot include a confirmation basis")
+        return self
 
 
 class EvidenceCreate(StrictModel):
@@ -163,6 +188,11 @@ class CreativeProject(CreativeProjectCreate):
     created_at: datetime
 
 
+class CreativeProjectPage(StrictModel):
+    items: list[CreativeProject]
+    next_cursor: str | None
+
+
 class ScriptSegment(StrictModel):
     order: int = Field(ge=0)
     onscreen_text: str
@@ -198,6 +228,10 @@ class RunCreate(StrictModel):
     brief_version: int = Field(ge=1)
 
 
+class CancelRequest(StrictModel):
+    reason: str | None = Field(max_length=500)
+
+
 class Run(StrictModel):
     id: UUID
     project_id: UUID
@@ -209,6 +243,8 @@ class Run(StrictModel):
         "prepare", "script", "fact_check", "review", "storyboard", "render", "complete"
     ]
     sequence: int = Field(ge=0)
+    attempt: int = Field(ge=1)
+    cancel_requested_at: datetime | None
     error_code: str | None = None
     error_message: str | None = None
     created_at: datetime
@@ -260,9 +296,12 @@ class RenderJob(StrictModel):
     status: Literal[
         "queued", "running", "waiting_review", "succeeded", "failed", "cancelled"
     ]
+    attempt: int = Field(ge=1)
+    cancel_requested_at: datetime | None
     output_ref: str | None = None
     error_message: str | None = None
     created_at: datetime
+    updated_at: datetime
 
 
 class PublicationChecklist(StrictModel):
@@ -286,6 +325,17 @@ class PublicationPackage(StrictModel):
     video_download_url: str
     publication_state: Literal["needs_manual_checks", "ready_for_manual_publish"]
     checklist: PublicationChecklist
+
+
+class CreativeWorkspace(StrictModel):
+    project: CreativeProject
+    book: BookEdition
+    promotion_candidate: PromotionCandidate
+    evidence: list[Evidence]
+    script_versions: list[ScriptVersion]
+    runs: list[Run]
+    render_jobs: list[RenderJob]
+    publication_package: PublicationPackage | None
 
 
 def _timezone_aware(value: datetime | None) -> datetime | None:

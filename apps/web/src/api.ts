@@ -29,6 +29,11 @@ export interface BookEdition extends BookCreate {
   created_at: string;
 }
 
+export interface BookPage {
+  items: BookEdition[];
+  next_cursor: string | null;
+}
+
 export interface PromotionCandidateCreate {
   book_id: string;
   platform: Platform;
@@ -43,6 +48,19 @@ export interface PromotionCandidate extends PromotionCandidateCreate {
   id: string;
   owner_user_id: string;
   created_at: string;
+  eligibility_revision: number;
+  eligibility_checked_by_user_id: string | null;
+}
+
+export interface PromotionEligibilityUpdate {
+  eligibility_status: EligibilityStatus;
+  expected_revision: number;
+  eligibility_note: string | null;
+  confirmation_basis: "creator_account_backend" | null;
+}
+
+export interface CancelRequest {
+  reason: string | null;
 }
 
 export interface EvidenceCreate {
@@ -81,6 +99,11 @@ export interface CreativeProject extends CreativeProjectCreate {
   created_at: string;
 }
 
+export interface CreativeProjectPage {
+  items: CreativeProject[];
+  next_cursor: string | null;
+}
+
 export interface ScriptSegment {
   order: number;
   onscreen_text: string;
@@ -116,6 +139,8 @@ export interface Run {
   status: RunStatus;
   stage: RunStage;
   sequence: number;
+  attempt: number;
+  cancel_requested_at: string | null;
   error_code: string | null;
   error_message: string | null;
   created_at: string;
@@ -127,10 +152,11 @@ export interface RunEvent {
   run_id: string;
   project_id: string;
   sequence: number;
-  type: "run.created" | "run.stage_changed" | "run.review_requested" | "run.reviewed" | "run.failed" | "run.completed" | "run.cancelled";
+  type: "run.created" | "run.stage_changed" | "run.review_requested" | "run.reviewed" | "run.failed" | "run.completed" | "run.cancel_requested" | "run.cancelled" | "run.retry_requested";
   status: RunStatus;
   stage: RunStage;
   occurred_at: string;
+  attempt?: number;
   script_version_id: string | null;
   render_id: string | null;
   reason_code: string | null;
@@ -170,9 +196,28 @@ export interface RenderJob {
   script_version_id: string;
   owner_user_id: string;
   status: RunStatus;
+  attempt: number;
+  cancel_requested_at: string | null;
   output_ref: string | null;
   error_message: string | null;
   created_at: string;
+  updated_at: string;
+}
+
+export interface CreativeWorkspace {
+  project: CreativeProject;
+  book: BookEdition;
+  promotion_candidate: PromotionCandidate;
+  evidence: Evidence[];
+  script_versions: ScriptVersion[];
+  runs: Run[];
+  render_jobs: RenderJob[];
+  publication_package: PublicationPackage | null;
+}
+
+export interface PageOptions {
+  limit?: number;
+  cursor?: string | null;
 }
 
 export interface PublicationPackage {
@@ -207,13 +252,15 @@ export class ApiRequestError extends Error {
   readonly status: number;
   readonly code: string | null;
   readonly requestId: string | null;
+  readonly details: Record<string, unknown> | null;
 
-  constructor(message: string, status: number, code: string | null, requestId: string | null) {
+  constructor(message: string, status: number, code: string | null, requestId: string | null, details: Record<string, unknown> | null = null) {
     super(message);
     this.name = "ApiRequestError";
     this.status = status;
     this.code = code;
     this.requestId = requestId;
+    this.details = details;
   }
 }
 
@@ -252,7 +299,7 @@ export class BookVideoApi {
     if (!response.ok) {
       const error = payload as ApiErrorBody | null;
       const message = error?.message ?? `API 请求失败（HTTP ${response.status}）`;
-      throw new ApiRequestError(message, response.status, error?.code ?? null, error?.request_id ?? null);
+      throw new ApiRequestError(message, response.status, error?.code ?? null, error?.request_id ?? null, error?.details ?? null);
     }
     return payload as T;
   }
@@ -276,6 +323,7 @@ export class BookVideoApi {
         response.status,
         error?.code ?? null,
         error?.request_id ?? null,
+        error?.details ?? null,
       );
     }
     return response.blob();
@@ -283,6 +331,13 @@ export class BookVideoApi {
 
   createBook(input: BookCreate): Promise<BookEdition> {
     return this.request("/books", { method: "POST", body: JSON.stringify(input) });
+  }
+
+  listBooks(options: PageOptions & { q?: string } = {}): Promise<BookPage> {
+    const query = new URLSearchParams({ limit: String(options.limit ?? 20) });
+    if (options.cursor) query.set("cursor", options.cursor);
+    if (options.q?.trim()) query.set("q", options.q.trim());
+    return this.request(`/books?${query.toString()}`);
   }
 
   createPromotionCandidate(input: PromotionCandidateCreate): Promise<PromotionCandidate> {
@@ -295,6 +350,39 @@ export class BookVideoApi {
 
   createProject(input: CreativeProjectCreate): Promise<CreativeProject> {
     return this.request("/creative-projects", { method: "POST", body: JSON.stringify(input) });
+  }
+
+  listCreativeProjects(options: PageOptions & { bookId?: string } = {}): Promise<CreativeProjectPage> {
+    const query = new URLSearchParams({ limit: String(options.limit ?? 20) });
+    if (options.cursor) query.set("cursor", options.cursor);
+    if (options.bookId) query.set("book_id", options.bookId);
+    return this.request(`/creative-projects?${query.toString()}`);
+  }
+
+  getCreativeWorkspace(projectId: string): Promise<CreativeWorkspace> {
+    return this.request(`/creative-projects/${encodeURIComponent(projectId)}/workspace`);
+  }
+
+  updatePromotionEligibility(candidateId: string, input: PromotionEligibilityUpdate): Promise<PromotionCandidate> {
+    return this.request(`/promotion-candidates/${encodeURIComponent(candidateId)}/eligibility`, {
+      method: "PATCH",
+      body: JSON.stringify(input),
+    });
+  }
+
+  cancelRun(runId: string, input: CancelRequest): Promise<Run> {
+    return this.request(`/runs/${encodeURIComponent(runId)}/cancel`, {
+      method: "POST",
+      headers: { "Idempotency-Key": idempotencyKey() },
+      body: JSON.stringify(input),
+    });
+  }
+
+  retryRun(runId: string): Promise<Run> {
+    return this.request(`/runs/${encodeURIComponent(runId)}/retry`, {
+      method: "POST",
+      headers: { "Idempotency-Key": idempotencyKey() },
+    });
   }
 
   listScripts(projectId: string): Promise<ScriptVersion[]> {
@@ -405,6 +493,21 @@ export class BookVideoApi {
 
   getRender(renderId: string): Promise<RenderJob> {
     return this.request(`/renders/${encodeURIComponent(renderId)}`);
+  }
+
+  cancelRender(renderId: string, input: CancelRequest): Promise<RenderJob> {
+    return this.request(`/renders/${encodeURIComponent(renderId)}/cancel`, {
+      method: "POST",
+      headers: { "Idempotency-Key": idempotencyKey() },
+      body: JSON.stringify(input),
+    });
+  }
+
+  retryRender(renderId: string): Promise<RenderJob> {
+    return this.request(`/renders/${encodeURIComponent(renderId)}/retry`, {
+      method: "POST",
+      headers: { "Idempotency-Key": idempotencyKey() },
+    });
   }
 
   downloadRender(renderId: string): Promise<Blob> {
