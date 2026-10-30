@@ -623,6 +623,8 @@ function App() {
         : latestRender
           ? orderedVersions.find((version) => version.id === latestRender.script_version_id) ?? orderedVersions.at(-1)
           : approvedVersion ?? orderedVersions.at(-1);
+      const savedVersionId = savedPreference(`book-video.selectedVersion.${projectId}`, "");
+      const restoredVersion = orderedVersions.find((version) => version.id === savedVersionId) ?? selected;
 
       setBook(workspace.book);
       setFactRevisionValue(workspace.book.facts[0]?.value ?? "");
@@ -633,7 +635,7 @@ function App() {
       setWorkspaceEvidence(workspace.evidence);
       setProject(workspace.project);
       setVersions(orderedVersions);
-      setSelectedVersionId(selected?.id ?? "");
+      setSelectedVersionId(restoredVersion?.id ?? "");
       setRun(latestRun);
       if (!latestRun) {
         setGenerationResults([]);
@@ -642,7 +644,7 @@ function App() {
       setEvents([]);
       setRunStreamWarning("");
       setRenderJob(latestRender);
-      setSelectedAudioAssetId(latestRender?.audio_asset_id ?? "");
+      setSelectedAudioAssetId(savedPreference(`book-video.selectedAudio.${projectId}`, latestRender?.audio_asset_id ?? ""));
       setPublicationPackage(workspace.publication_package);
       setPackagePreviewShown(false);
       setBookDraft({
@@ -1240,7 +1242,10 @@ function App() {
       const sha256 = [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
       const asset = await api.uploadAudioAsset({ file: voiceFile, sha256, rights_proof_note: voiceProofNote.trim(), expires_at: dateInputToIso(voiceExpiry) });
       setAudioAssets(await api.listAudioAssets());
-      if (audioIsAllowed(asset)) setSelectedAudioAssetId(asset.id);
+      if (audioIsAllowed(asset)) {
+        setSelectedAudioAssetId(asset.id);
+        if (project) savePreference(`book-video.selectedAudio.${project.id}`, asset.id);
+      }
       setVoiceFile(null);
       setVoiceProofNote("");
       setVoiceAttested(false);
@@ -1593,7 +1598,7 @@ function App() {
                       {run && mode === "api" && <section className="generation-records" aria-label="生成与费用记录">
                         <div className="versions-header"><div><h2>生成与费用</h2><p>按当前任务读取服务端实际记录。金额未知时保留缺失原因。</p></div></div>
                         {generationResults.length ? generationResults.map((result) => <article className="generation-record" key={result.id}>
-                          <strong>{result.status === "succeeded" ? "生成完成" : "生成失败"} · {result.source === "deterministic_fixture" ? "本地确定性样稿" : `${result.provider_key} / ${result.model_key}`}</strong>
+                          <strong>{result.reason_code === "manual_reconciliation_required" ? "需要人工核对供应商结果与费用" : result.status === "succeeded" ? "生成完成" : "生成失败"} · {result.source === "deterministic_fixture" ? "本地确定性样稿" : `${result.provider_key} / ${result.model_key}`}</strong>
                           <small>第 {result.attempt} 轮 · {formatTime(result.created_at)} · {result.script_version_id ? `脚本 ${shortId(result.script_version_id)}` : `原因 ${result.reason_code || "未提供"}`}</small>
                           <small>{costRecords.filter((cost) => cost.generation_result_id === result.id).map(formatCost).join("；") || "费用记录尚未返回"}</small>
                         </article>) : <p className="muted-copy">暂无生成记录；任务进行中时会自动刷新。</p>}
@@ -1605,7 +1610,7 @@ function App() {
                       ) : (
                         <div className="version-tabs">
                           {versions.map((version) => (
-                            <button className={`version-tab ${selectedVersionId === version.id ? "is-selected" : ""}`} key={version.id} onClick={() => setSelectedVersionId(version.id)} type="button">
+                            <button className={`version-tab ${selectedVersionId === version.id ? "is-selected" : ""}`} key={version.id} onClick={() => { setSelectedVersionId(version.id); savePreference(`book-video.selectedVersion.${project.id}`, version.id); }} type="button">
                               <span className="version-number">v{version.version_number}</span><span className="version-tab-title">{version.title_suggestion}</span><ReviewPill status={version.review_status} />
                             </button>
                           ))}
@@ -1617,7 +1622,7 @@ function App() {
                           <h3>{version.title_suggestion}</h3>
                           <p>{version.description_suggestion}</p>
                           <ol>{version.segments.map((segment) => <li key={segment.order}><b>{segment.onscreen_text}</b><span>{segment.narration}</span><small>{segment.duration_seconds} 秒 · 事实键 {segment.fact_keys.join("、") || "无"}</small></li>)}</ol>
-                          <button className="button button-secondary" onClick={() => setSelectedVersionId(version.id)} type="button">{selectedVersionId === version.id ? "当前选中审核版" : "选择这版改稿 / 审核"}</button>
+                          <button className="button button-secondary" onClick={() => { setSelectedVersionId(version.id); savePreference(`book-video.selectedVersion.${project.id}`, version.id); }} type="button">{selectedVersionId === version.id ? "当前选中审核版" : "选择这版改稿 / 审核"}</button>
                         </article>)}
                       </div>}
                       {selectedVersion && (
@@ -1700,7 +1705,7 @@ function App() {
                           <div className="render-box-head"><div className="render-glyph">▧</div><div><strong>{renderJob ? `渲染 ${shortId(renderJob.id)}` : "竖屏文字动效成片"}</strong><small>{renderJob ? `${statusName(renderJob.status)} · 第 ${renderJob.attempt} 轮 · 更新于 ${formatTime(renderJob.updated_at)}${renderJob.error_message ? ` · ${renderJob.error_message}` : ""}` : "1080 × 1920 · 使用审核通过的脚本"}</small></div>{renderJob && <span className={`run-pill ${renderJob.status}`}>{statusName(renderJob.status)}</span>}</div>
                           <div className="audio-panel">
                             <div className="versions-header"><div><h2>声音方案</h2><p>可选择静音或已由服务端核验的本人录音。录音文件只上传给当前 API，不把本地路径交给 worker。</p></div></div>
-                            <Field label="本次成片的声音"><select onChange={(event) => setSelectedAudioAssetId(event.target.value)} value={selectedAudioAssetId}><option value="">静音（成片无音轨）</option>{audioAssets.map((asset) => <option disabled={!audioIsAllowed(asset)} key={asset.id} value={asset.id}>{asset.origin === "self_recorded_voice" ? "本人录音" : "已许可声音"} · {Math.round(asset.duration_ms / 1000)} 秒 · {shortId(asset.id)}{audioIsAllowed(asset) ? "" : " · 许可不可用"}</option>)}</select></Field>
+                            <Field label="本次成片的声音"><select onChange={(event) => { setSelectedAudioAssetId(event.target.value); savePreference(`book-video.selectedAudio.${project.id}`, event.target.value); }} value={selectedAudioAssetId}><option value="">静音（成片无音轨）</option>{audioAssets.map((asset) => <option disabled={!audioIsAllowed(asset)} key={asset.id} value={asset.id}>{asset.origin === "self_recorded_voice" ? "本人录音" : "已许可声音"} · {Math.round(asset.duration_ms / 1000)} 秒 · {shortId(asset.id)}{audioIsAllowed(asset) ? "" : " · 许可不可用"}</option>)}</select></Field>
                             {selectedAudioAsset && <p className={selectedAudioAllowed ? "muted-copy" : "blocked-hint"}>许可：{selectedAudioAsset.usage_status === "allowed" ? "服务端允许" : "服务端阻止"} · {selectedAudioAsset.rights_proof_note} · 到期 {selectedAudioAsset.expires_at ? formatTime(selectedAudioAsset.expires_at) : "未设期限"}{selectedAudioAllowed ? "" : "；请改用静音或登记有效录音"}</p>}
                             <form className="voice-upload" onSubmit={uploadVoice}>
                               <h3>上传本人录音</h3>

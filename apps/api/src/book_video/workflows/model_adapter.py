@@ -34,6 +34,13 @@ class ModelAdapterError(RuntimeError):
 
 
 class ModelAdapter(Protocol):
+    """Optional recovery hooks: lookup_result(key) and supports_request_idempotency.
+
+    Only set supports_request_idempotency when the provider guarantees that
+    repeating the same key returns the same logical invocation and bill.
+    A lookup returning None is safe to retry only with that guarantee.
+    """
+
     def generate(self, *, variant: str, context: Mapping[str, Any]) -> ModelResponse: ...
 
 

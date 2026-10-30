@@ -746,7 +746,7 @@ components:
         provider_key: { type: string, minLength: 1 }
         model_key: { type: string, minLength: 1 }
         status: { type: string, enum: [succeeded, failed] }
-        reason_code: { type: [string, 'null'], enum: [null, provider_unavailable, provider_timeout, invalid_output, unsupported_claim, missing_fact_basis, prohibited_claim, cancelled] }
+        reason_code: { type: [string, 'null'], enum: [null, provider_unavailable, provider_timeout, invalid_output, unsupported_claim, missing_fact_basis, prohibited_claim, cancelled, manual_reconciliation_required] }
         input_digest: { type: string, pattern: '^[a-f0-9]{64}$', description: SHA-256 of canonical request without prompt text }
         output_digest: { type: [string, 'null'], description: SHA-256 of canonical structured output on success }
         script_version_id: { anyOf: [{ $ref: '#/components/schemas/Id' }, { type: 'null' }] }

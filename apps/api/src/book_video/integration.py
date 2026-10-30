@@ -17,6 +17,7 @@ from book_video.workflows import (
     create_script_generation_graph,
     run_script_generation,
 )
+from book_video.workflows.script_generation import ManualReconciliationRequired
 
 
 log = logging.getLogger(__name__)
@@ -86,10 +87,17 @@ def _script_adapter(service: DomainService, project_id: str):
 
 
 def _generation_adapter(service: DomainService):
-    def persist(result: Mapping[str, Any], cost: Mapping[str, Any]) -> dict[str, Any]:
-        return service.persist_generation(result, cost)
+    class DurableGenerationSink:
+        def __call__(self, result: Mapping[str, Any], cost: Mapping[str, Any], recovery_script: Mapping[str, Any] | None = None) -> dict[str, Any]:
+            return service.persist_generation(result, cost, recovery_script)
 
-    return persist
+        def lookup(self, run_id: str, invocation_key: str) -> dict[str, Any] | None:
+            return service.get_generation_invocation(run_id, invocation_key)
+
+        def reserve(self, run_id: str, invocation_key: str, input_digest: str) -> bool:
+            return service.reserve_generation_invocation(run_id, invocation_key, input_digest)
+
+    return DurableGenerationSink()
 
 
 def _checkpoint_saver(service: DomainService) -> SQLiteCheckpointSaver:
@@ -173,6 +181,8 @@ def process_queued_run(service: DomainService) -> bool:
             persist_generation=_generation_adapter(service),
             cancel_check=lambda: service.is_run_cancel_requested(run_id),
         )
+    except ManualReconciliationRequired as error:
+        _finish_run_error(service, run_id, error, "manual_reconciliation_required")
     except WorkflowCancelledError as error:
         service.confirm_run_cancelled(run_id, str(error))
     except Exception as error:
@@ -219,6 +229,8 @@ def process_resumable_run(service: DomainService) -> bool:
             graph.invoke(None, config=config)
         if service.get_run(run_id)["status"] == "running":
             raise RuntimeError("Recovered graph made no persisted state transition")
+    except ManualReconciliationRequired as error:
+        _finish_run_error(service, run_id, error, "manual_reconciliation_required")
     except WorkflowCancelledError as error:
         service.confirm_run_cancelled(run_id, str(error))
     except Exception as error:

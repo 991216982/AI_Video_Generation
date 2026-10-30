@@ -25,7 +25,7 @@ from book_video.workflows.model_adapter import (
 EventSink = Callable[[Mapping[str, Any]], None]
 ScriptSink = Callable[[Mapping[str, Any]], None]
 CancelCheck = Callable[[], bool]
-GenerationSink = Callable[[Mapping[str, Any], Mapping[str, Any]], Mapping[str, Any]]
+GenerationSink = Callable[..., Mapping[str, Any]]
 
 SAFE_FACT_KEYS = {
     "title",
@@ -48,6 +48,10 @@ class ReviewGateError(ScriptGenerationError):
 
 class WorkflowCancelledError(RuntimeError):
     """The owning run has a persisted cancellation request."""
+
+
+class ManualReconciliationRequired(RuntimeError):
+    """An external request may have completed, so a human must check provider billing/output."""
 
 
 class GenerationState(TypedDict, total=False):
@@ -680,7 +684,7 @@ def create_script_generation_graph(
 
         def record_attempt(
             variant: str, response: ModelResponse | None, script: Mapping[str, Any] | None,
-            reason_code: str | None, source: str,
+            reason_code: str | None, source: str, persisted_record: Mapping[str, Any] | None = None,
         ) -> dict[str, Any]:
             nonlocal sequence
             _check_cancelled(cancel_check)
@@ -722,7 +726,9 @@ def create_script_generation_graph(
                 cost_payload["missing_reason"] = None
             if cost_payload["amount_minor"] is None and not cost_payload["missing_reason"]:
                 cost_payload["missing_reason"] = "provider_billing_unavailable"
-            if persist_generation is None:
+            if persisted_record is not None:
+                persisted = persisted_record
+            elif persist_generation is None:
                 result_id = str(uuid5(NAMESPACE_URL, f"book-video:generation:{invocation_key}"))
                 cost_id = str(uuid5(NAMESPACE_URL, f"book-video:cost:{invocation_key}"))
                 persisted = {
@@ -730,7 +736,10 @@ def create_script_generation_graph(
                     "cost_record": {**cost_payload, "id": cost_id, "run_id": state["run_id"], "owner_user_id": project["owner_user_id"], "generation_result_id": result_id, "recorded_at": _utc_now()},
                 }
             else:
-                persisted = persist_generation(result_payload, cost_payload)
+                if source == "external_model" and script is not None:
+                    persisted = persist_generation(result_payload, cost_payload, script)
+                else:
+                    persisted = persist_generation(result_payload, cost_payload)
             result = dict(persisted["generation_result"])
             cost = dict(persisted["cost_record"])
             results.append(result)
@@ -738,7 +747,7 @@ def create_script_generation_graph(
             sequence += 1
             events.append(append_event(
                 state, sequence=sequence,
-                event_type="run.generation_completed" if script is not None else "run.generation_failed",
+                event_type="run.generation_completed" if result["status"] == "succeeded" else "run.generation_failed",
                 status="running", stage="script", attempt=attempt,
                 generation_result_id=str(result["id"]), reason_code=reason_code,
             ))
@@ -769,8 +778,65 @@ def create_script_generation_graph(
                 ],
             }
             response: ModelResponse | None = None
+            invocation_key = context["invocation_key"]
+            input_digest = _digest({
+                "run_id": state["run_id"], "project_id": snapshot["project"]["id"],
+                "book_id": snapshot["book"]["id"], "variant": variant,
+                "fact_revision_refs": fixture["fact_revision_refs"],
+            })
+            prior = None
+            if source == "external_model" and persist_generation is not None:
+                lookup = getattr(persist_generation, "lookup", None)
+                reserve = getattr(persist_generation, "reserve", None)
+                if lookup is None or reserve is None:
+                    raise ScriptGenerationError("external model requires a durable invocation store")
+                prior = lookup(state["run_id"], invocation_key)
+                if prior is not None and prior["input_digest"] != input_digest:
+                    raise ScriptGenerationError("stored generation input differs from this invocation")
+                if prior is None:
+                    if not reserve(state["run_id"], invocation_key, input_digest):
+                        raise ManualReconciliationRequired("Concurrent provider invocation reservation needs manual reconciliation")
+                elif prior.get("generation_result") is not None:
+                    saved = prior["generation_result"]
+                    saved_script = prior.get("recovery_script")
+                    if saved["status"] == "succeeded":
+                        if not isinstance(saved_script, dict) or saved_script.get("id") != fixture["id"] or _script_content_blockers(snapshot, saved_script):
+                            raise ManualReconciliationRequired("Persisted model output needs manual reconciliation")
+                        digest = _digest({key: saved_script[key] for key in (
+                            "title_suggestion", "description_suggestion", "segments", "fact_revision_refs"
+                        )})
+                        if digest != saved["output_digest"]:
+                            raise ManualReconciliationRequired("Persisted model output digest needs manual reconciliation")
+                        record_attempt(variant, None, saved_script, None, source, prior)
+                        script = deepcopy(saved_script)
+                        script["generation_result_id"] = saved["id"]
+                        _check_cancelled(cancel_check)
+                        script_sink(script)
+                        scripts.append(script)
+                        continue
+                    record_attempt(variant, None, None, saved["reason_code"], source, prior)
+                    if saved["reason_code"] == "manual_reconciliation_required":
+                        raise ManualReconciliationRequired("Provider invocation needs manual reconciliation")
+                    response = fixture_adapter.generate(variant=variant, context={**context, "fixture_scripts": fixture_by_variant})
+                    script = _model_script(snapshot, fixture, response)
+                    result = record_attempt(variant, response, script, None, "deterministic_fixture")
+                    script["generation_result_id"] = result["id"]
+                    _check_cancelled(cancel_check)
+                    script_sink(script)
+                    scripts.append(script)
+                    continue
+                else:
+                    lookup_provider = getattr(adapter, "lookup_result", None)
+                    try:
+                        response = lookup_provider(invocation_key) if callable(lookup_provider) else None
+                    except ModelAdapterError:
+                        response = None
+                    if response is None and not getattr(adapter, "supports_request_idempotency", False):
+                        record_attempt(variant, None, None, "manual_reconciliation_required", source)
+                        raise ManualReconciliationRequired("Provider invocation may have completed; check its result and bill manually")
             try:
-                response = adapter.generate(variant=variant, context={**context, "fixture_scripts": fixture_by_variant} if model_adapter is None else context)
+                if response is None:
+                    response = adapter.generate(variant=variant, context={**context, "fixture_scripts": fixture_by_variant} if model_adapter is None else context)
                 if not isinstance(response, ModelResponse):
                     raise ModelAdapterError("invalid_output", "model adapter returned an invalid response")
                 if response.source != source:

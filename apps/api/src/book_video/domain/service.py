@@ -989,7 +989,61 @@ class DomainService:
     def get_run(self, run_id: UUID | str) -> JsonObject:
         return self._get_or_404("runs", run_id, "Run")
 
-    def persist_generation(self, result_payload: Any, cost_payload: Any) -> JsonObject:
+    def get_generation_invocation(self, run_id: UUID | str, invocation_key: str) -> JsonObject | None:
+        """Read a completed invocation and its private recovery script before any provider call."""
+        run_key = _as_uuid(run_id)
+        with self.database.read() as conn:
+            if self._get(conn, "runs", run_key) is None:
+                raise not_found("Run")
+            row = conn.execute(
+                "SELECT state, input_digest, recovery_script FROM generation_invocations "
+                "WHERE owner_user_id = ? AND run_id = ? AND invocation_key = ?",
+                (self.owner_user_id, run_key, invocation_key),
+            ).fetchone()
+            result_row = conn.execute(
+                "SELECT payload FROM generation_results WHERE owner_user_id = ? AND run_id = ? AND invocation_key = ?",
+                (self.owner_user_id, run_key, invocation_key),
+            ).fetchone()
+            if row is None and result_row is None:
+                return None
+            result = _payload(result_row) if result_row is not None else None
+            cost = None
+            if result is not None:
+                cost_row = conn.execute(
+                    "SELECT payload FROM model_cost_records WHERE owner_user_id = ? AND generation_result_id = ?",
+                    (self.owner_user_id, result["id"]),
+                ).fetchone()
+                cost = _payload(cost_row) if cost_row is not None else None
+            return {
+                "state": row["state"] if row is not None else "completed",
+                "input_digest": row["input_digest"] if row is not None else result["input_digest"],
+                "recovery_script": json.loads(row["recovery_script"]) if row is not None and row["recovery_script"] else None,
+                "generation_result": result,
+                "cost_record": cost,
+            }
+
+    def reserve_generation_invocation(self, run_id: UUID | str, invocation_key: str, input_digest: str) -> bool:
+        """Durably mark an external call before it can leave this process."""
+        run_key = _as_uuid(run_id)
+        with self.database.transaction() as conn:
+            if self._get(conn, "runs", run_key) is None:
+                raise not_found("Run")
+            row = conn.execute(
+                "SELECT run_id, input_digest FROM generation_invocations WHERE owner_user_id = ? AND invocation_key = ?",
+                (self.owner_user_id, invocation_key),
+            ).fetchone()
+            if row is not None:
+                if row["run_id"] != run_key or row["input_digest"] != input_digest:
+                    raise conflict("idempotency_key_conflict", "Generation invocation key was reused with different input")
+                return False
+            conn.execute(
+                "INSERT INTO generation_invocations(owner_user_id, run_id, invocation_key, input_digest, state) "
+                "VALUES (?, ?, ?, ?, 'started')",
+                (self.owner_user_id, run_key, invocation_key, input_digest),
+            )
+        return True
+
+    def persist_generation(self, result_payload: Any, cost_payload: Any, recovery_script: Any = None) -> JsonObject:
         """Atomically record one invocation and one actual or unknown cost."""
         request = _dump(result_payload)
         cost_request = _dump(cost_payload)
@@ -1004,7 +1058,7 @@ class DomainService:
             raise DomainError(422, "validation_error", "Generation source or status is invalid")
         if status == "succeeded" and (reason is not None or not request.get("output_digest") or not request.get("script_version_id")):
             raise DomainError(422, "validation_error", "Successful generation requires a script ID and output digest")
-        if status == "failed" and (reason not in {"provider_unavailable", "provider_timeout", "invalid_output", "unsupported_claim", "missing_fact_basis", "prohibited_claim", "cancelled"} or request.get("output_digest") or request.get("script_version_id")):
+        if status == "failed" and (reason not in {"provider_unavailable", "provider_timeout", "invalid_output", "unsupported_claim", "missing_fact_basis", "prohibited_claim", "cancelled", "manual_reconciliation_required"} or request.get("output_digest") or request.get("script_version_id")):
             raise DomainError(422, "validation_error", "Failed generation needs a stable reason and no script")
         for digest in (request.get("input_digest"), request.get("output_digest")):
             if digest is not None and not re.fullmatch(r"[a-f0-9]{64}", str(digest)):
@@ -1021,6 +1075,15 @@ class DomainService:
             run = self._get(conn, "runs", run_key)
             if run is None:
                 raise not_found("Run")
+            invocation = conn.execute(
+                "SELECT run_id, input_digest, recovery_script FROM generation_invocations WHERE owner_user_id = ? AND invocation_key = ?",
+                (self.owner_user_id, invocation_key),
+            ).fetchone()
+            if invocation is not None and (invocation["run_id"] != run_key or invocation["input_digest"] != request["input_digest"]):
+                raise conflict("idempotency_key_conflict", "Generation invocation key was reused with different input")
+            recovery_json = _json(recovery_script) if recovery_script is not None else None
+            if status == "succeeded" and source == "external_model" and recovery_json is None and invocation is not None and invocation["recovery_script"] is None:
+                raise DomainError(422, "validation_error", "External generation requires a recoverable script")
             existing_row = conn.execute(
                 "SELECT payload FROM generation_results WHERE owner_user_id = ? AND invocation_key = ?",
                 (self.owner_user_id, invocation_key),
@@ -1041,6 +1104,8 @@ class DomainService:
                 if any(existing_cost.get(key) != cost_request.get(key) for key in
                        ("currency", "amount_minor", "missing_reason", "input_tokens", "output_tokens")):
                     raise conflict("idempotency_key_conflict", "Generation cost changed on replay")
+                if recovery_json is not None and invocation is not None and invocation["recovery_script"] != recovery_json:
+                    raise conflict("idempotency_key_conflict", "Generation recovery script changed on replay")
                 return {"generation_result": existing, "cost_record": existing_cost}
             result_id, cost_id, now = str(uuid4()), str(uuid4()), _utc_now()
             result = {
@@ -1073,6 +1138,13 @@ class DomainService:
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 (cost_id, self.owner_user_id, run_key, result_id, now, _json(cost)),
             )
+            if invocation is not None:
+                conn.execute(
+                    "UPDATE generation_invocations SET state = ?, recovery_script = ? "
+                    "WHERE owner_user_id = ? AND invocation_key = ?",
+                    ("manual_reconciliation_required" if reason == "manual_reconciliation_required" else "completed",
+                     recovery_json, self.owner_user_id, invocation_key),
+                )
         return {"generation_result": result, "cost_record": cost}
 
     def list_generation_results(self, run_id: UUID | str) -> list[JsonObject]:
