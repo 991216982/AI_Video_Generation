@@ -5,6 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+import subprocess
+import tempfile
 import base64
 import binascii
 from datetime import datetime, timedelta, timezone
@@ -114,11 +117,77 @@ class DomainService:
                 "owner_user_id": self.owner_user_id,
                 "created_at": created_at,
             }
+            result["facts"] = [{**fact, "revision": 1} for fact in book_data["facts"]]
             conn.execute(
                 "INSERT INTO books(id, owner_user_id, created_at, payload) VALUES (?, ?, ?, ?)",
                 (book_id, self.owner_user_id, created_at, _json(result)),
             )
+            for fact in result["facts"]:
+                revision = {**fact, "book_id": book_id, "created_at": created_at,
+                            "created_by_user_id": self.owner_user_id}
+                conn.execute(
+                    "INSERT INTO book_fact_revisions(book_id, owner_user_id, fact_key, revision, payload) "
+                    "VALUES (?, ?, ?, 1, ?)",
+                    (book_id, self.owner_user_id, fact["key"], _json(revision)),
+                )
         return result
+
+    def revise_book_fact(self, book_id: UUID | str, fact_key: str, data: Any) -> JsonObject:
+        book_key = _as_uuid(book_id)
+        request = _dump(data)
+        if not fact_key or "/" in fact_key:
+            raise DomainError(422, "validation_error", "Invalid fact key")
+        status = request["verification_status"]
+        note = (request.get("source_note") or "").strip()
+        evidence_id = request.get("evidence_id")
+        if status == "human_confirmed" and not note:
+            raise DomainError(422, "validation_error", "Human confirmation requires a note")
+        if status == "source_verified" and not (note or evidence_id):
+            raise DomainError(422, "validation_error", "Source verification requires a note or evidence")
+        with self.database.transaction() as conn:
+            row = self._get_row(conn, "books", book_key)
+            if row is None:
+                raise not_found("Book edition")
+            book = _payload(row)
+            facts = book.get("facts", [])
+            current = next((fact for fact in facts if fact["key"] == fact_key), None)
+            if current is None:
+                raise not_found("Book fact")
+            if evidence_id and self._get(conn, "evidence", evidence_id) is None:
+                raise not_found("Evidence")
+            current_revision = int(current.get("revision", 1))
+            if request["expected_revision"] != current_revision:
+                raise conflict("revision_conflict", "Book fact changed since it was loaded",
+                               expected_revision=request["expected_revision"], current_revision=current_revision)
+            next_revision = current_revision + 1
+            now = _utc_now()
+            revision = {"book_id": book_key, "key": fact_key, "revision": next_revision,
+                        "value": request["value"], "verification_status": status,
+                        "source_note": request.get("source_note"), "evidence_id": evidence_id,
+                        "created_at": now, "created_by_user_id": self.owner_user_id}
+            book["facts"] = [
+                {key: revision[key] for key in ("key", "value", "verification_status", "source_note", "evidence_id", "revision")}
+                if fact["key"] == fact_key else fact for fact in facts
+            ]
+            conn.execute("UPDATE books SET payload = ? WHERE id = ? AND owner_user_id = ?",
+                         (_json(book), book_key, self.owner_user_id))
+            conn.execute("INSERT INTO book_fact_revisions(book_id, owner_user_id, fact_key, revision, payload) "
+                         "VALUES (?, ?, ?, ?, ?)",
+                         (book_key, self.owner_user_id, fact_key, next_revision, _json(revision)))
+        return revision
+
+    def list_book_fact_revisions(self, book_id: UUID | str, fact_key: str) -> list[JsonObject]:
+        book_key = _as_uuid(book_id)
+        with self.database.read() as conn:
+            book = self._get(conn, "books", book_key)
+            if book is None or not any(fact["key"] == fact_key for fact in book.get("facts", [])):
+                raise not_found("Book fact")
+            rows = conn.execute(
+                "SELECT payload FROM book_fact_revisions WHERE book_id = ? AND owner_user_id = ? "
+                "AND fact_key = ? ORDER BY revision",
+                (book_key, self.owner_user_id, fact_key),
+            ).fetchall()
+        return [_payload(row) for row in rows]
 
     def get_book(self, book_id: UUID | str) -> JsonObject:
         return self._get_or_404("books", book_id, "Book edition")
@@ -243,42 +312,25 @@ class DomainService:
     def create_promotion_candidate(self, data: Any) -> JsonObject:
         candidate_data = _dump(data)
         book_id = _as_uuid(candidate_data["book_id"])
-        if candidate_data.get("eligibility_status", "unverified") == MANUALLY_CONFIRMED:
-            checked_at = candidate_data.get("eligibility_checked_at")
-            note = candidate_data.get("eligibility_note")
-            if not checked_at or not note:
-                raise DomainError(
-                    422,
-                    "manual_check_required",
-                    "Manual product confirmation requires a check time and note",
-                )
-            if _timestamp(checked_at) > datetime.now(timezone.utc):
-                raise DomainError(
-                    422,
-                    "invalid_manual_check_time",
-                    "Product eligibility check time cannot be in the future",
-                )
+        if candidate_data.get("eligibility_status", "unverified") != "unverified" or candidate_data.get("eligibility_checked_at") is not None or "confirmation_basis" in candidate_data:
+            raise DomainError(422, "validation_error", "Promotion candidate must be created unverified")
         with self.database.transaction() as conn:
             book = self._get(conn, "books", book_id)
             if book is None:
                 raise not_found("Book edition")
             candidate_id = str(uuid4())
             created_at = _utc_now()
-            confirmed = candidate_data.get("eligibility_status") == MANUALLY_CONFIRMED
             result = {
                 **candidate_data,
                 "book_id": book_id,
                 "id": candidate_id,
                 "owner_user_id": self.owner_user_id,
                 "created_at": created_at,
-                "eligibility_checked_at": (
-                    candidate_data.get("eligibility_checked_at") if confirmed else None
-                ),
-                "eligibility_note": candidate_data.get("eligibility_note") if confirmed else None,
+                "eligibility_status": "unverified",
+                "eligibility_checked_at": None,
+                "eligibility_note": candidate_data.get("eligibility_note"),
                 "eligibility_revision": 1,
-                "eligibility_checked_by_user_id": (
-                    self.owner_user_id if confirmed else None
-                ),
+                "eligibility_checked_by_user_id": None,
             }
             conn.execute(
                 "INSERT INTO promotion_candidates"
@@ -298,6 +350,119 @@ class DomainService:
 
     def get_promotion_candidate(self, candidate_id: UUID | str) -> JsonObject:
         return self._get_or_404("promotion_candidates", candidate_id, "Promotion candidate")
+
+    def upload_audio_asset(
+        self, content: bytes, *, sha256: str, origin: str, rights_attested: bool,
+        rights_proof_note: str, permitted_uses: str, expires_at: str | None = None,
+        declared_mime_type: str | None = None,
+    ) -> JsonObject:
+        if not isinstance(content, bytes) or not content or len(content) > 10 * 1024 * 1024:
+            raise DomainError(422, "validation_error", "Audio must be 1 byte to 10 MiB")
+        if not re.fullmatch(r"[a-f0-9]{64}", sha256) or hashlib.sha256(content).hexdigest() != sha256:
+            raise DomainError(422, "validation_error", "Audio SHA-256 does not match")
+        if origin not in {"self_recorded_voice", "licensed_voice"} or not rights_attested or not rights_proof_note.strip() or permitted_uses != "render_and_manual_publish":
+            raise DomainError(422, "asset_rights_blocked", "Audio rights declaration is incomplete")
+        expiry = _timestamp(expires_at) if expires_at else None
+        if origin == "licensed_voice" and expiry is None:
+            raise DomainError(422, "asset_rights_blocked", "Licensed voice requires an expiry")
+        if expiry is not None and expiry <= datetime.now(timezone.utc):
+            raise DomainError(422, "asset_rights_blocked", "Audio permission has expired")
+        private_dir = self.render_output_dir.parent / "audio" / self.owner_user_id
+        private_dir.mkdir(parents=True, exist_ok=True)
+        # Probe and finalize on the destination volume. Windows cannot rename a
+        # tempfile from the system drive into a workspace on another drive.
+        with tempfile.NamedTemporaryFile(suffix=".audio", dir=private_dir, delete=False) as temporary:
+            temporary.write(content)
+            temporary_path = Path(temporary.name)
+        try:
+            try:
+                probe = subprocess.run(
+                    ["ffprobe", "-v", "error", "-show_format", "-show_streams",
+                     "-of", "json", str(temporary_path)],
+                    capture_output=True, text=True, timeout=15, check=True,
+                )
+                media = json.loads(probe.stdout)
+            except (OSError, subprocess.SubprocessError, ValueError) as exc:
+                raise DomainError(422, "validation_error", "Audio format could not be verified") from exc
+            streams = media.get("streams", [])
+            if not any(stream.get("codec_type") == "audio" for stream in streams) or any(stream.get("codec_type") == "video" for stream in streams):
+                raise DomainError(422, "validation_error", "Upload must contain audio only")
+            format_name = media.get("format", {}).get("format_name", "").split(",")
+            if "wav" in format_name:
+                mime_type, extension = "audio/wav", ".wav"
+            elif "mp3" in format_name:
+                mime_type, extension = "audio/mpeg", ".mp3"
+            elif "mov" in format_name or "mp4" in format_name:
+                mime_type, extension = "audio/mp4", ".m4a"
+            else:
+                raise DomainError(422, "validation_error", "Unsupported audio format")
+            if declared_mime_type and declared_mime_type != mime_type:
+                raise DomainError(422, "validation_error", "Declared audio MIME does not match media format")
+            try:
+                duration_ms = round(float(media["format"]["duration"]) * 1000)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise DomainError(422, "validation_error", "Audio duration is unavailable") from exc
+            if not 1 <= duration_ms <= 45000:
+                raise DomainError(422, "validation_error", "Audio duration must not exceed 45 seconds")
+            asset_id = str(uuid4())
+            now = _utc_now()
+            storage_path = private_dir / f"{asset_id}{extension}"
+            temporary_path.replace(storage_path)
+            result = {
+                "id": asset_id, "owner_user_id": self.owner_user_id, "origin": origin,
+                "sha256": sha256, "mime_type": mime_type, "duration_ms": duration_ms,
+                "rights_attested": True, "rights_proof_note": rights_proof_note.strip(),
+                "permitted_uses": permitted_uses,
+                "expires_at": expiry.isoformat().replace("+00:00", "Z") if expiry else None,
+                "usage_status": "allowed", "created_at": now,
+            }
+            try:
+                with self.database.transaction() as conn:
+                    conn.execute(
+                        "INSERT INTO audio_assets(id, owner_user_id, sha256, storage_path, created_at, payload) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (asset_id, self.owner_user_id, sha256, str(storage_path), now, _json(result)),
+                    )
+            except BaseException:
+                storage_path.unlink(missing_ok=True)
+                raise
+            return result
+        finally:
+            temporary_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _current_audio_status(asset: JsonObject) -> JsonObject:
+        allowed = bool(asset.get("rights_attested") and asset.get("rights_proof_note")
+                       and asset.get("permitted_uses") == "render_and_manual_publish")
+        expiry = asset.get("expires_at")
+        if asset.get("origin") == "licensed_voice" and not expiry:
+            allowed = False
+        if expiry and _timestamp(expiry) <= datetime.now(timezone.utc):
+            allowed = False
+        return {**asset, "usage_status": "allowed" if allowed else "blocked"}
+
+    def get_audio_asset(self, audio_asset_id: UUID | str) -> JsonObject:
+        asset = self._get_or_404("audio_assets", audio_asset_id, "Audio asset")
+        return self._current_audio_status(asset)
+
+    def list_audio_assets(self) -> list[JsonObject]:
+        with self.database.read() as conn:
+            rows = conn.execute("SELECT payload FROM audio_assets WHERE owner_user_id = ? ORDER BY created_at DESC, id DESC", (self.owner_user_id,)).fetchall()
+        return [self._current_audio_status(_payload(row)) for row in rows]
+
+    def get_audio_asset_media(self, audio_asset_id: UUID | str) -> Path:
+        asset_key = _as_uuid(audio_asset_id)
+        with self.database.read() as conn:
+            row = self._get_row(conn, "audio_assets", asset_key)
+            if row is None:
+                raise not_found("Audio asset")
+            asset = self._current_audio_status(_payload(row))
+            if asset["usage_status"] != "allowed":
+                raise DomainError(422, "asset_rights_blocked", "Audio rights are not current")
+            path = Path(row["storage_path"]).resolve()
+            if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != asset["sha256"]:
+                raise DomainError(422, "asset_rights_blocked", "Audio asset is unavailable or changed")
+            return path
 
     def update_promotion_eligibility(
         self, candidate_id: UUID | str, data: Any
@@ -351,11 +516,12 @@ class DomainService:
             }
             conn.execute(
                 "UPDATE promotion_candidates SET eligibility_revision = ?, "
-                "eligibility_checked_by_user_id = ?, payload = ? "
+                "eligibility_checked_by_user_id = ?, confirmation_basis = ?, payload = ? "
                 "WHERE id = ? AND owner_user_id = ? AND eligibility_revision = ?",
                 (
                     updated["eligibility_revision"],
                     updated["eligibility_checked_by_user_id"],
+                    basis if confirmed else None,
                     _json(updated),
                     candidate_key,
                     self.owner_user_id,
@@ -551,6 +717,8 @@ class DomainService:
             result = {
                 **script_data,
                 "based_on_version_id": based_on_id,
+                "generation_result_id": None,
+                "fact_revision_refs": self._fact_revision_refs(book, script_data),
                 "id": script_id,
                 "project_id": project_key,
                 "owner_user_id": self.owner_user_id,
@@ -631,6 +799,14 @@ class DomainService:
                 raise not_found("Creative project")
             book = self._get(conn, "books", project["book_id"])
             self._validate_script_content(conn, project, book, content)
+            generation_result_id = generated.get("generation_result_id")
+            if generation_result_id:
+                generation = self._get(conn, "generation_results", generation_result_id)
+                if generation is None or generation.get("script_version_id") != script_key:
+                    raise conflict("generation_result_mismatch", "Generated script must reference its own result")
+                source_run = self._get(conn, "runs", generation["run_id"])
+                if source_run is None or source_run["project_id"] != project_key:
+                    raise conflict("generation_result_mismatch", "Generation result belongs to another project")
             if based_on_id:
                 base = self._get(conn, "script_versions", based_on_id)
                 if base is None or base["project_id"] != project_key:
@@ -692,6 +868,8 @@ class DomainService:
                 )
             result = {
                 **content,
+                "generation_result_id": generated.get("generation_result_id"),
+                "fact_revision_refs": self._fact_revision_refs(book, content),
                 "id": script_key,
                 "project_id": project_key,
                 "owner_user_id": self.owner_user_id,
@@ -810,6 +988,108 @@ class DomainService:
 
     def get_run(self, run_id: UUID | str) -> JsonObject:
         return self._get_or_404("runs", run_id, "Run")
+
+    def persist_generation(self, result_payload: Any, cost_payload: Any) -> JsonObject:
+        """Atomically record one invocation and one actual or unknown cost."""
+        request = _dump(result_payload)
+        cost_request = _dump(cost_payload)
+        run_key = _as_uuid(request["run_id"])
+        invocation_key = str(request.get("invocation_key") or "").strip()
+        if not invocation_key:
+            raise DomainError(422, "validation_error", "Generation invocation_key is required")
+        source = request.get("source")
+        status = request.get("status")
+        reason = request.get("reason_code")
+        if source not in {"deterministic_fixture", "external_model"} or status not in {"succeeded", "failed"}:
+            raise DomainError(422, "validation_error", "Generation source or status is invalid")
+        if status == "succeeded" and (reason is not None or not request.get("output_digest") or not request.get("script_version_id")):
+            raise DomainError(422, "validation_error", "Successful generation requires a script ID and output digest")
+        if status == "failed" and (reason not in {"provider_unavailable", "provider_timeout", "invalid_output", "unsupported_claim", "missing_fact_basis", "prohibited_claim", "cancelled"} or request.get("output_digest") or request.get("script_version_id")):
+            raise DomainError(422, "validation_error", "Failed generation needs a stable reason and no script")
+        for digest in (request.get("input_digest"), request.get("output_digest")):
+            if digest is not None and not re.fullmatch(r"[a-f0-9]{64}", str(digest)):
+                raise DomainError(422, "validation_error", "Generation digest must be SHA-256")
+        amount = cost_request.get("amount_minor")
+        missing = cost_request.get("missing_reason")
+        if amount is None and not missing:
+            raise DomainError(422, "validation_error", "Unknown cost requires missing_reason")
+        if amount is not None and (not isinstance(amount, int) or amount < 0 or missing is not None):
+            raise DomainError(422, "validation_error", "Actual cost must be nonnegative and have no missing reason")
+        if source == "deterministic_fixture" and amount != 0:
+            raise DomainError(422, "validation_error", "Deterministic generation has zero cost")
+        with self.database.transaction() as conn:
+            run = self._get(conn, "runs", run_key)
+            if run is None:
+                raise not_found("Run")
+            existing_row = conn.execute(
+                "SELECT payload FROM generation_results WHERE owner_user_id = ? AND invocation_key = ?",
+                (self.owner_user_id, invocation_key),
+            ).fetchone()
+            if existing_row is not None:
+                existing = _payload(existing_row)
+                if existing["run_id"] != run_key or any(
+                    existing.get(key) != request.get(key)
+                    for key in ("source", "provider_key", "model_key", "status", "reason_code",
+                                "input_digest", "output_digest", "script_version_id")
+                ):
+                    raise conflict("idempotency_key_conflict", "Generation invocation key was reused with different content")
+                cost_row = conn.execute(
+                    "SELECT payload FROM model_cost_records WHERE owner_user_id = ? AND generation_result_id = ?",
+                    (self.owner_user_id, existing["id"]),
+                ).fetchone()
+                existing_cost = _payload(cost_row)
+                if any(existing_cost.get(key) != cost_request.get(key) for key in
+                       ("currency", "amount_minor", "missing_reason", "input_tokens", "output_tokens")):
+                    raise conflict("idempotency_key_conflict", "Generation cost changed on replay")
+                return {"generation_result": existing, "cost_record": existing_cost}
+            result_id, cost_id, now = str(uuid4()), str(uuid4()), _utc_now()
+            result = {
+                "id": result_id, "run_id": run_key, "owner_user_id": self.owner_user_id,
+                "attempt": int(run["attempt"]), "invocation_key": invocation_key,
+                "source": source, "provider_key": str(request["provider_key"]),
+                "model_key": str(request["model_key"]), "status": status,
+                "reason_code": reason, "input_digest": request["input_digest"],
+                "output_digest": request.get("output_digest"),
+                "script_version_id": str(request["script_version_id"]) if request.get("script_version_id") else None,
+                "created_at": now,
+            }
+            currency = cost_request.get("currency", "CNY")
+            if not re.fullmatch(r"[A-Z]{3}", currency):
+                raise DomainError(422, "validation_error", "Currency must be ISO 4217")
+            cost = {
+                "id": cost_id, "run_id": run_key, "owner_user_id": self.owner_user_id,
+                "generation_result_id": result_id, "currency": currency,
+                "amount_minor": amount, "missing_reason": missing,
+                "input_tokens": cost_request.get("input_tokens"),
+                "output_tokens": cost_request.get("output_tokens"), "recorded_at": now,
+            }
+            conn.execute(
+                "INSERT INTO generation_results(id, owner_user_id, run_id, invocation_key, status, script_version_id, created_at, payload) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (result_id, self.owner_user_id, run_key, invocation_key, status, result["script_version_id"], now, _json(result)),
+            )
+            conn.execute(
+                "INSERT INTO model_cost_records(id, owner_user_id, run_id, generation_result_id, recorded_at, payload) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (cost_id, self.owner_user_id, run_key, result_id, now, _json(cost)),
+            )
+        return {"generation_result": result, "cost_record": cost}
+
+    def list_generation_results(self, run_id: UUID | str) -> list[JsonObject]:
+        run_key = _as_uuid(run_id)
+        with self.database.read() as conn:
+            if self._get(conn, "runs", run_key) is None:
+                raise not_found("Run")
+            rows = conn.execute("SELECT payload FROM generation_results WHERE owner_user_id = ? AND run_id = ? ORDER BY created_at, id", (self.owner_user_id, run_key)).fetchall()
+        return [_payload(row) for row in rows]
+
+    def list_run_costs(self, run_id: UUID | str) -> list[JsonObject]:
+        run_key = _as_uuid(run_id)
+        with self.database.read() as conn:
+            if self._get(conn, "runs", run_key) is None:
+                raise not_found("Run")
+            rows = conn.execute("SELECT payload FROM model_cost_records WHERE owner_user_id = ? AND run_id = ? ORDER BY recorded_at, id", (self.owner_user_id, run_key)).fetchall()
+        return [_payload(row) for row in rows]
 
     def cancel_run(
         self, run_id: UUID | str, data: Any, idempotency_key: str
@@ -1477,7 +1757,16 @@ class DomainService:
             book = self._get(conn, "books", project["book_id"]) if project else None
             if not project or not script or not candidate or not book:
                 raise conflict("render_references_missing", "Render references are unavailable")
+            self._validate_script_fact_revisions(book, script)
             rights = json.loads(row["asset_rights"])
+            audio_asset_id = row["audio_asset_id"]
+            audio_asset = self._get(conn, "audio_assets", audio_asset_id) if audio_asset_id else None
+            if audio_asset_id and audio_asset is None:
+                raise not_found("Audio asset")
+            if audio_asset is not None:
+                audio_asset = self._current_audio_status(audio_asset)
+                if audio_asset["usage_status"] != "allowed":
+                    raise DomainError(422, "asset_rights_blocked", "Audio rights are not current")
         return {
             "owner_user_id": self.owner_user_id,
             "render": render,
@@ -1487,6 +1776,8 @@ class DomainService:
             "promotion_candidate": candidate,
             "script_version": script,
             "asset_rights": rights,
+            "audio_asset_id": audio_asset_id,
+            "audio_asset": audio_asset,
         }
 
     def list_run_events(
@@ -1668,6 +1959,9 @@ class DomainService:
             "reason_code": raw.get("reason_code"),
             "message": raw.get("message"),
         }
+        for field in ("generation_result_id", "cost_record_id"):
+            if raw.get(field):
+                event[field] = _as_uuid(raw[field])
         if "attempt" in raw:
             event["attempt"] = raw["attempt"]
         with self.database.transaction() as conn:
@@ -1740,9 +2034,28 @@ class DomainService:
             if (
                 event_status == run["status"]
                 and event_stage == run["stage"]
-                and event_type != RunEventType.REVIEW_REQUESTED.value
+                and event_type not in {
+                    RunEventType.REVIEW_REQUESTED.value,
+                    RunEventType.GENERATION_COMPLETED.value,
+                    RunEventType.GENERATION_FAILED.value,
+                    RunEventType.COST_RECORDED.value,
+                }
             ):
                 raise conflict("run_unchanged", "RunEvent must change status or stage")
+            if event_type in {
+                RunEventType.GENERATION_COMPLETED.value,
+                RunEventType.GENERATION_FAILED.value,
+                RunEventType.COST_RECORDED.value,
+            }:
+                result_id = event.get("generation_result_id")
+                result = self._get(conn, "generation_results", result_id) if result_id else None
+                if result is None or result["run_id"] != run_key:
+                    raise not_found("Generation result")
+                if event_type == RunEventType.COST_RECORDED.value:
+                    cost_id = event.get("cost_record_id")
+                    cost = self._get(conn, "model_cost_records", cost_id) if cost_id else None
+                    if cost is None or cost["generation_result_id"] != result_id:
+                        raise not_found("Model cost record")
             if script_key:
                 script = self._get(conn, "script_versions", script_key)
                 if script is None or script["project_id"] != project_key:
@@ -1914,6 +2227,7 @@ class DomainService:
         project_key = _as_uuid(render_data["project_id"])
         script_key = _as_uuid(render_data["script_version_id"])
         candidate_key = _as_uuid(render_data["promotion_candidate_id"])
+        audio_asset_id = _as_uuid(render_data["audio_asset_id"]) if render_data.get("audio_asset_id") else None
         hash_value = _request_hash(render_data)
         if not render_data.get("asset_rights"):
             raise conflict(
@@ -1940,6 +2254,12 @@ class DomainService:
                 raise not_found("Script version")
             if candidate is None:
                 raise not_found("Promotion candidate")
+            if audio_asset_id is not None:
+                audio_asset = self._get(conn, "audio_assets", audio_asset_id)
+                if audio_asset is None:
+                    raise not_found("Audio asset")
+                if self._current_audio_status(audio_asset)["usage_status"] != "allowed":
+                    raise DomainError(422, "asset_rights_blocked", "Audio rights are not current")
             if (
                 candidate_key != project["promotion_candidate_id"]
                 or candidate["book_id"] != project["book_id"]
@@ -1952,6 +2272,8 @@ class DomainService:
                 raise conflict(
                     "script_not_approved", "Only an approved script version can be rendered"
                 )
+            book = self._get(conn, "books", project["book_id"])
+            self._validate_script_fact_revisions(book, script)
             if candidate["eligibility_status"] != MANUALLY_CONFIRMED:
                 raise conflict(
                     "product_not_confirmed",
@@ -1974,6 +2296,7 @@ class DomainService:
                 "id": render_id,
                 "project_id": project_key,
                 "script_version_id": script_key,
+                "audio_asset_id": audio_asset_id,
                 "owner_user_id": self.owner_user_id,
                 "status": RunStatus.QUEUED.value,
                 "attempt": 1,
@@ -1986,9 +2309,9 @@ class DomainService:
             conn.execute(
                 "INSERT INTO render_jobs"
                 "(id, owner_user_id, project_id, script_version_id, promotion_candidate_id, "
-                "status, idempotency_key, request_hash, asset_rights, attempt, "
+                "status, idempotency_key, request_hash, asset_rights, audio_asset_id, attempt, "
                 "cancel_requested_at, created_at, updated_at, payload) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     render_id,
                     self.owner_user_id,
@@ -1999,6 +2322,7 @@ class DomainService:
                     idempotency_key,
                     hash_value,
                     _json(normalized_rights),
+                    audio_asset_id,
                     result["attempt"],
                     result["cancel_requested_at"],
                     now,
@@ -2410,6 +2734,7 @@ class DomainService:
         candidate = self._get(conn, "promotion_candidates", project["promotion_candidate_id"])
         if book is None or candidate is None:
             raise conflict("project_references_missing", "Project references are unavailable")
+
         for fact in book.get("facts", []):
             if fact["verification_status"] == "unverified":
                 raise conflict(
@@ -2456,6 +2781,24 @@ class DomainService:
             "title_suggestion": script["title_suggestion"],
             "description_suggestion": script["description_suggestion"],
         }
+
+    @staticmethod
+    def _fact_revision_refs(book: JsonObject, script_data: JsonObject) -> list[JsonObject]:
+        used_keys = {key for segment in script_data["segments"] for key in segment["fact_keys"]}
+        return [
+            {"key": fact["key"], "revision": int(fact.get("revision", 1))}
+            for fact in book.get("facts", []) if fact["key"] in used_keys
+        ]
+
+    @staticmethod
+    def _validate_script_fact_revisions(book: JsonObject | None, script: JsonObject) -> None:
+        if book is None:
+            raise not_found("Book edition")
+        current = {fact["key"]: fact for fact in book.get("facts", [])}
+        for ref in script.get("fact_revision_refs", []):
+            fact = current.get(ref["key"])
+            if fact is None or fact["verification_status"] == "unverified":
+                raise conflict("book_fact_unverified", "A script fact was withdrawn or is unverified", fact_key=ref["key"])
 
     def _validate_script_content(
         self,
@@ -2641,6 +2984,9 @@ class DomainService:
             "script_versions",
             "runs",
             "render_jobs",
+            "audio_assets",
+            "generation_results",
+            "model_cost_records",
         }:
             raise ValueError(f"Unsupported table {table}")
         return conn.execute(
@@ -2724,7 +3070,9 @@ class DomainService:
                 "event_status_mismatch",
                 f"{event_type} requires status {required_status}",
             )
-        if parsed in {RunEventType.CANCEL_REQUESTED, RunEventType.RETRY_REQUESTED}:
+        if parsed in {RunEventType.CANCEL_REQUESTED, RunEventType.RETRY_REQUESTED,
+                      RunEventType.GENERATION_COMPLETED, RunEventType.GENERATION_FAILED,
+                      RunEventType.COST_RECORDED}:
             if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
                 raise DomainError(
                     422,

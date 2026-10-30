@@ -36,6 +36,9 @@ class RunEventType(str, Enum):
     CANCEL_REQUESTED = "run.cancel_requested"
     CANCELLED = "run.cancelled"
     RETRY_REQUESTED = "run.retry_requested"
+    GENERATION_COMPLETED = "run.generation_completed"
+    GENERATION_FAILED = "run.generation_failed"
+    COST_RECORDED = "run.cost_recorded"
 
 
 ALLOWED_RUN_TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {

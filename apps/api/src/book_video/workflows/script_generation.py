@@ -1,15 +1,11 @@
-"""Deterministic two-variant script generation with a resumable review gate.
-
-The workflow only uses verified bibliographic facts and the creator's own
-opinion. It deliberately has no model, network, TTS, or media-provider call.
-Integration code supplies persistence and event callbacks, plus a durable
-LangGraph checkpointer when resume must survive a worker restart.
-"""
+"""Two original script variants with a resumable, human review gate."""
 
 from __future__ import annotations
 
 from copy import deepcopy
 from datetime import datetime, timezone
+import hashlib
+import json
 from typing import Any, Callable, Mapping, Sequence, TypedDict
 from uuid import NAMESPACE_URL, uuid5
 
@@ -18,11 +14,18 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
 from book_video.media.rights import asset_rights_blockers
+from book_video.workflows.model_adapter import (
+    DeterministicFixtureAdapter,
+    ModelAdapter,
+    ModelAdapterError,
+    ModelResponse,
+)
 
 
 EventSink = Callable[[Mapping[str, Any]], None]
 ScriptSink = Callable[[Mapping[str, Any]], None]
 CancelCheck = Callable[[], bool]
+GenerationSink = Callable[[Mapping[str, Any], Mapping[str, Any]], Mapping[str, Any]]
 
 SAFE_FACT_KEYS = {
     "title",
@@ -60,6 +63,8 @@ class GenerationState(TypedDict, total=False):
     review_gate_error: list[str]
     approved_script_version_id: str
     review_outcome: str
+    generation_results: list[dict[str, Any]]
+    cost_records: list[dict[str, Any]]
 
 
 _DEFAULT_CHECKPOINTER = MemorySaver()
@@ -74,7 +79,15 @@ def _check_cancelled(cancel_check: CancelCheck | None) -> None:
         raise WorkflowCancelledError("run cancellation was requested")
 
 
-def _verified_metadata_fact(book: Mapping[str, Any]) -> dict[str, str]:
+def _fact_has_basis(fact: Mapping[str, Any]) -> bool:
+    status = fact.get("verification_status")
+    note = str(fact.get("source_note") or "").strip()
+    return (status == "human_confirmed" and bool(note)) or (
+        status == "source_verified" and bool(note or fact.get("evidence_id"))
+    )
+
+
+def _verified_metadata_fact(book: Mapping[str, Any]) -> dict[str, Any]:
     facts = book.get("facts")
     if not isinstance(facts, list):
         raise ScriptGenerationError("book.facts must be a list")
@@ -85,14 +98,14 @@ def _verified_metadata_fact(book: Mapping[str, Any]) -> dict[str, str]:
         key = str(raw_fact.get("key", "")).strip()
         status = raw_fact.get("verification_status")
         value = str(raw_fact.get("value", "")).strip()
-        if key not in SAFE_FACT_KEYS or status not in {"source_verified", "human_confirmed"} or not value:
+        if key not in SAFE_FACT_KEYS or status not in {"source_verified", "human_confirmed"} or not value or not _fact_has_basis(raw_fact):
             continue
         # Prefer matching the edition metadata so an unrelated fact cannot be
         # presented as the book's title, author, or publisher.
         metadata_value = book.get(key)
         if metadata_value is not None and str(metadata_value).strip() != value:
             continue
-        return {"key": key, "value": value}
+        return {"key": key, "value": value, "revision": int(raw_fact.get("revision") or 1)}
 
     raise ScriptGenerationError(
         "at least one verified bibliographic fact is required; unverified or book-text facts are not used"
@@ -129,7 +142,7 @@ def _validate_snapshot(snapshot: Mapping[str, Any], run_id: str) -> dict[str, An
     if not original_opinion:
         raise ScriptGenerationError("book.original_opinion is required")
 
-    fact = _verified_metadata_fact(book)
+    _verified_metadata_fact(book)
     run_snapshot = copied.get("run", {})
     if isinstance(run_snapshot, Mapping) and run_snapshot.get("id") and str(run_snapshot["id"]) != run_id:
         raise ScriptGenerationError("run_id does not match snapshot.run.id")
@@ -151,8 +164,11 @@ def _make_event(
     script_version_id: str | None = None,
     reason_code: str | None = None,
     message: str | None = None,
+    attempt: int | None = None,
+    generation_result_id: str | None = None,
+    cost_record_id: str | None = None,
 ) -> dict[str, Any]:
-    return {
+    event = {
         "event_id": str(uuid5(NAMESPACE_URL, f"book-video:{run_id}:event:{sequence}")),
         "run_id": run_id,
         "project_id": project_id,
@@ -166,6 +182,13 @@ def _make_event(
         "reason_code": reason_code,
         "message": message,
     }
+    if attempt is not None:
+        event["attempt"] = attempt
+    if generation_result_id is not None:
+        event["generation_result_id"] = generation_result_id
+    if cost_record_id is not None:
+        event["cost_record_id"] = cost_record_id
+    return event
 
 
 def _verified_fact_keys(snapshot: Mapping[str, Any]) -> set[str]:
@@ -178,7 +201,7 @@ def _verified_fact_keys(snapshot: Mapping[str, Any]) -> set[str]:
         value = str(fact.get("value", "")).strip()
         if key not in SAFE_FACT_KEYS or not value:
             continue
-        if fact.get("verification_status") not in {"source_verified", "human_confirmed"}:
+        if fact.get("verification_status") not in {"source_verified", "human_confirmed"} or not _fact_has_basis(fact):
             continue
         metadata_value = book.get(key)
         if metadata_value is not None and str(metadata_value).strip() != value:
@@ -336,10 +359,48 @@ def _make_scripts(snapshot: Mapping[str, Any], run_id: str) -> list[dict[str, An
                 "title_suggestion": item["title_suggestion"],
                 "description_suggestion": item["description_suggestion"],
                 "review_status": "pending",
+                "generation_result_id": None,
+                "fact_revision_refs": [{"key": fact["key"], "revision": fact["revision"]}],
                 "created_at": _utc_now(),
             }
         )
     return result
+
+
+def _digest(value: Mapping[str, Any]) -> str:
+    canonical = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _model_script(
+    snapshot: Mapping[str, Any], fixture: Mapping[str, Any], response: ModelResponse
+) -> dict[str, Any]:
+    """Bind provider content to server-owned IDs and exact fact revisions."""
+
+    raw = response.script
+    if not isinstance(raw, Mapping):
+        raise ModelAdapterError("invalid_output", "model output must be a structured script")
+    script = deepcopy(dict(fixture))
+    for field in ("title_suggestion", "description_suggestion", "segments"):
+        if field not in raw:
+            raise ModelAdapterError("invalid_output", f"model output is missing {field}")
+        script[field] = deepcopy(raw[field])
+    blockers = _script_content_blockers(snapshot, script)
+    if blockers:
+        reason = "prohibited_claim" if "script_contains_prohibited_claim" in blockers else (
+            "missing_fact_basis" if "script_facts_not_verified" in blockers else "invalid_output"
+        )
+        raise ModelAdapterError(reason, ", ".join(blockers))
+    used_keys = {str(key) for segment in script["segments"] for key in segment["fact_keys"]}
+    revisions = {
+        str(fact["key"]): int(fact.get("revision") or 1)
+        for fact in snapshot["book"].get("facts", [])
+        if isinstance(fact, Mapping) and _fact_has_basis(fact)
+    }
+    script["fact_revision_refs"] = [
+        {"key": key, "revision": revisions[key]} for key in sorted(used_keys)
+    ]
+    return script
 
 
 def _script_content_blockers(
@@ -392,6 +453,21 @@ def _script_content_blockers(
         blockers.append("script_duration_invalid")
     if not used_fact_keys or not used_fact_keys.issubset(_verified_fact_keys(snapshot)):
         blockers.append("script_facts_not_verified")
+    refs = script.get("fact_revision_refs")
+    if not isinstance(refs, list):
+        blockers.append("script_fact_revisions_missing")
+    else:
+        current = {
+            str(fact.get("key")): int(fact.get("revision") or 1)
+            for fact in snapshot["book"].get("facts", [])
+            if isinstance(fact, Mapping) and _fact_has_basis(fact)
+        }
+        pinned = {
+            str(ref.get("key")): ref.get("revision")
+            for ref in refs if isinstance(ref, Mapping)
+        }
+        if set(pinned) != used_fact_keys or any(current.get(key) != pinned.get(key) for key in used_fact_keys):
+            blockers.append("script_fact_revisions_stale")
 
     prohibited = [
         str(item).strip().casefold()
@@ -517,6 +593,8 @@ def create_script_generation_graph(
     checkpointer: Any = None,
     emit_event: EventSink | None = None,
     persist_script: ScriptSink | None = None,
+    persist_generation: GenerationSink | None = None,
+    model_adapter: ModelAdapter | None = None,
     cancel_check: CancelCheck | None = None,
 ) -> Any:
     """Compile the generation graph with caller-provided integration hooks.
@@ -529,6 +607,7 @@ def create_script_generation_graph(
 
     event_sink = emit_event or (lambda _event: None)
     script_sink = persist_script or (lambda _script: None)
+    fixture_adapter = DeterministicFixtureAdapter()
 
     def append_event(
         state: GenerationState,
@@ -540,6 +619,9 @@ def create_script_generation_graph(
         script_version_id: str | None = None,
         reason_code: str | None = None,
         message: str | None = None,
+        attempt: int | None = None,
+        generation_result_id: str | None = None,
+        cost_record_id: str | None = None,
     ) -> dict[str, Any]:
         event = _make_event(
             run_id=state["run_id"],
@@ -554,6 +636,9 @@ def create_script_generation_graph(
             script_version_id=script_version_id,
             reason_code=reason_code,
             message=message,
+            attempt=attempt,
+            generation_result_id=generation_result_id,
+            cost_record_id=cost_record_id,
         )
         event_sink(event)
         return event
@@ -583,13 +668,128 @@ def create_script_generation_graph(
 
     def generate(state: GenerationState) -> dict[str, Any]:
         _check_cancelled(cancel_check)
-        scripts = _make_scripts(state["snapshot"], state["run_id"])
-        # Check once after pure generation and before persistence begins. The
-        # domain sink still owns the final atomic cancellation guard.
-        _check_cancelled(cancel_check)
-        for script in scripts:
+        snapshot = state["snapshot"]
+        fixtures = _make_scripts(snapshot, state["run_id"])
+        fixture_by_variant = {variant: script for variant, script in zip(("A", "B"), fixtures)}
+        attempt = int(snapshot.get("run", {}).get("attempt") or 1)
+        sequence = state["event_sequence"]
+        events = list(state.get("events", []))
+        results: list[dict[str, Any]] = []
+        costs: list[dict[str, Any]] = []
+        scripts: list[dict[str, Any]] = []
+
+        def record_attempt(
+            variant: str, response: ModelResponse | None, script: Mapping[str, Any] | None,
+            reason_code: str | None, source: str,
+        ) -> dict[str, Any]:
+            nonlocal sequence
+            _check_cancelled(cancel_check)
+            project = snapshot["project"]
+            invocation_key = f"{state['run_id']}:script:{variant}:{source}"
+            input_digest = _digest({
+                "run_id": state["run_id"], "project_id": project["id"],
+                "book_id": snapshot["book"]["id"], "variant": variant,
+                "fact_revision_refs": fixture_by_variant[variant]["fact_revision_refs"],
+            })
+            output_digest = _digest({
+                "title_suggestion": script["title_suggestion"],
+                "description_suggestion": script["description_suggestion"],
+                "segments": script["segments"],
+                "fact_revision_refs": script["fact_revision_refs"],
+            }) if script is not None else None
+            result_payload = {
+                "run_id": state["run_id"],
+                "invocation_key": invocation_key,
+                "source": source,
+                "provider_key": response.provider_key if response else "unavailable_provider",
+                "model_key": response.model_key if response else "unknown_model",
+                "status": "succeeded" if script is not None else "failed",
+                "reason_code": reason_code,
+                "input_digest": input_digest,
+                "output_digest": output_digest,
+                "script_version_id": script["id"] if script is not None else None,
+            }
+            cost_payload = {
+                "currency": response.currency if response else "CNY",
+                "amount_minor": response.amount_minor if response else None,
+                "missing_reason": response.missing_reason if response else "provider_billing_unavailable",
+                "input_tokens": response.input_tokens if response else None,
+                "output_tokens": response.output_tokens if response else None,
+            }
+            if source == "deterministic_fixture":
+                cost_payload.update(amount_minor=0, missing_reason=None, input_tokens=0, output_tokens=0)
+            elif cost_payload["amount_minor"] is not None:
+                cost_payload["missing_reason"] = None
+            if cost_payload["amount_minor"] is None and not cost_payload["missing_reason"]:
+                cost_payload["missing_reason"] = "provider_billing_unavailable"
+            if persist_generation is None:
+                result_id = str(uuid5(NAMESPACE_URL, f"book-video:generation:{invocation_key}"))
+                cost_id = str(uuid5(NAMESPACE_URL, f"book-video:cost:{invocation_key}"))
+                persisted = {
+                    "generation_result": {**result_payload, "id": result_id, "owner_user_id": project["owner_user_id"], "attempt": attempt, "created_at": _utc_now()},
+                    "cost_record": {**cost_payload, "id": cost_id, "run_id": state["run_id"], "owner_user_id": project["owner_user_id"], "generation_result_id": result_id, "recorded_at": _utc_now()},
+                }
+            else:
+                persisted = persist_generation(result_payload, cost_payload)
+            result = dict(persisted["generation_result"])
+            cost = dict(persisted["cost_record"])
+            results.append(result)
+            costs.append(cost)
+            sequence += 1
+            events.append(append_event(
+                state, sequence=sequence,
+                event_type="run.generation_completed" if script is not None else "run.generation_failed",
+                status="running", stage="script", attempt=attempt,
+                generation_result_id=str(result["id"]), reason_code=reason_code,
+            ))
+            sequence += 1
+            events.append(append_event(
+                state, sequence=sequence, event_type="run.cost_recorded",
+                status="running", stage="script", attempt=attempt,
+                generation_result_id=str(result["id"]), cost_record_id=str(cost["id"]),
+            ))
+            return result
+
+        for variant in ("A", "B"):
+            fixture = fixture_by_variant[variant]
+            source = "external_model" if model_adapter is not None else "deterministic_fixture"
+            adapter = model_adapter or fixture_adapter
+            context = {
+                "invocation_key": f"{state['run_id']}:script:{variant}:{source}",
+                "project": {key: snapshot["project"].get(key) for key in (
+                    "target_audience", "target_platform", "desired_seconds", "original_angle",
+                    "tone_instruction", "prohibited_claims",
+                )},
+                "book_edition_id": snapshot["book"]["id"],
+                "original_opinion": snapshot["book"]["original_opinion"],
+                "verified_facts": [
+                    {key: fact.get(key) for key in ("key", "value", "revision", "source_note", "evidence_id")}
+                    for fact in snapshot["book"].get("facts", [])
+                    if isinstance(fact, Mapping) and _fact_has_basis(fact)
+                ],
+            }
+            response: ModelResponse | None = None
+            try:
+                response = adapter.generate(variant=variant, context={**context, "fixture_scripts": fixture_by_variant} if model_adapter is None else context)
+                if not isinstance(response, ModelResponse):
+                    raise ModelAdapterError("invalid_output", "model adapter returned an invalid response")
+                if response.source != source:
+                    raise ModelAdapterError("invalid_output", "model adapter source does not match configuration")
+                script = _model_script(snapshot, fixture, response)
+            except ModelAdapterError as error:
+                if model_adapter is None:
+                    raise ScriptGenerationError(str(error)) from error
+                record_attempt(variant, response, None, error.reason_code, source)
+                response = fixture_adapter.generate(variant=variant, context={**context, "fixture_scripts": fixture_by_variant})
+                script = _model_script(snapshot, fixture, response)
+                source = "deterministic_fixture"
+            result = record_attempt(variant, response, script, None, source)
+            script["generation_result_id"] = result["id"]
+            _check_cancelled(cancel_check)
             script_sink(script)
-        sequence = state["event_sequence"] + 1
+            scripts.append(script)
+
+        sequence += 1
         event = append_event(
             state,
             sequence=sequence,
@@ -600,8 +800,10 @@ def create_script_generation_graph(
         )
         return {
             "scripts": scripts,
+            "generation_results": results,
+            "cost_records": costs,
             "event_sequence": event["sequence"],
-            "events": state.get("events", []) + [event],
+            "events": events + [event],
             "stage": "fact_check",
             "status": "running",
         }
@@ -846,6 +1048,8 @@ def run_script_generation(
     checkpointer: Any = None,
     emit_event: EventSink | None = None,
     persist_script: ScriptSink | None = None,
+    persist_generation: GenerationSink | None = None,
+    model_adapter: ModelAdapter | None = None,
     review_decision: Mapping[str, Any] | None = None,
     cancel_check: CancelCheck | None = None,
 ) -> dict[str, Any]:
@@ -863,6 +1067,8 @@ def run_script_generation(
         checkpointer=checkpointer,
         emit_event=emit_event,
         persist_script=persist_script,
+        persist_generation=persist_generation,
+        model_adapter=model_adapter,
         cancel_check=cancel_check,
     )
 

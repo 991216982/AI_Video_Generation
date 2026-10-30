@@ -7,6 +7,7 @@ import {
   DEFAULT_API_BASE_URL,
 } from "./api";
 import type {
+  AudioAsset,
   BookPage,
   BookCreate,
   BookEdition,
@@ -16,6 +17,8 @@ import type {
   CreativeWorkspace,
   Evidence,
   EvidenceCreate,
+  GenerationResult,
+  ModelCostRecord,
   Platform,
   PromotionCandidate,
   PromotionCandidateCreate,
@@ -71,6 +74,7 @@ interface BriefDraft {
   platform: Platform;
   seconds: number;
   angle: string;
+  toneInstruction: string;
   prohibitedClaims: string;
 }
 
@@ -111,6 +115,7 @@ const EMPTY_BRIEF: BriefDraft = {
   platform: "douyin",
   seconds: 30,
   angle: "",
+  toneInstruction: "",
   prohibitedClaims: "疗效、保证结果、未核实销量",
 };
 
@@ -192,6 +197,15 @@ function formatTime(value: string | undefined): string {
   return Number.isNaN(parsed.getTime())
     ? value
     : new Intl.DateTimeFormat("zh-CN", { dateStyle: "medium", timeStyle: "short" }).format(parsed);
+}
+
+function audioIsAllowed(asset: AudioAsset): boolean {
+  return asset.usage_status === "allowed" && asset.rights_attested && Boolean(asset.rights_proof_note.trim()) && (!asset.expires_at || Date.parse(asset.expires_at) > Date.now());
+}
+
+function formatCost(record: ModelCostRecord): string {
+  if (record.amount_minor === null) return `金额未知：${record.missing_reason || "供应商未提供实际费用"}`;
+  return `${record.currency} ${(record.amount_minor / 100).toFixed(2)}（实际记录）`;
 }
 
 function errorMessage(error: unknown): string {
@@ -279,6 +293,8 @@ function demoScriptVersions(project: CreativeProject, book: BookEdition, angle: 
       title_suggestion: `${book.title}：从一个小选择开始`,
       description_suggestion: "虚构演示脚本，仅展示原创表达结构；不是事实核验或商品推荐结论。",
       review_status: "pending",
+      generation_result_id: null,
+      fact_revision_refs: book.facts.filter((fact) => fact.verification_status !== "unverified").map((fact) => ({ key: fact.key, revision: fact.revision ?? 1 })),
       created_at: nowIso(),
     },
     {
@@ -291,6 +307,8 @@ function demoScriptVersions(project: CreativeProject, book: BookEdition, angle: 
       title_suggestion: "先画一条很短的路｜虚构演示稿",
       description_suggestion: "演示用的第二种原创叙述角度，不包含真实销量、疗效或未经核实事实。",
       review_status: "pending",
+      generation_result_id: null,
+      fact_revision_refs: book.facts.filter((fact) => fact.verification_status !== "unverified").map((fact) => ({ key: fact.key, revision: fact.revision ?? 1 })),
       created_at: nowIso(),
     },
   ];
@@ -321,6 +339,9 @@ function App() {
   const [candidateDraft, setCandidateDraft] = useState<CandidateDraft>(EMPTY_CANDIDATE);
   const [evidenceDraft, setEvidenceDraft] = useState<EvidenceDraft>(EMPTY_EVIDENCE);
   const [briefDraft, setBriefDraft] = useState<BriefDraft>(EMPTY_BRIEF);
+  const [factRevisionValue, setFactRevisionValue] = useState("");
+  const [factRevisionNote, setFactRevisionNote] = useState("");
+  const [factRevisionStatus, setFactRevisionStatus] = useState<BookDraft["factStatus"]>("unverified");
   const [eligibilityAttestation, setEligibilityAttestation] = useState(false);
   const [eligibilityNote, setEligibilityNote] = useState("");
   const [cancelReason, setCancelReason] = useState("");
@@ -339,13 +360,22 @@ function App() {
 
   const [run, setRun] = useState<Run | null>(null);
   const [events, setEvents] = useState<RunEvent[]>([]);
+  const [generationResults, setGenerationResults] = useState<GenerationResult[]>([]);
+  const [costRecords, setCostRecords] = useState<ModelCostRecord[]>([]);
   const [runStreamWarning, setRunStreamWarning] = useState("");
   const [reviewDecision, setReviewDecision] = useState<"approve" | "reject">("approve");
   const [reviewNote, setReviewNote] = useState("");
   const [reviewFlags, setReviewFlags] = useState({ fact: false, product: false, rights: false });
 
   const [renderRightsConfirmed, setRenderRightsConfirmed] = useState(false);
+  const [audioAssets, setAudioAssets] = useState<AudioAsset[]>([]);
+  const [selectedAudioAssetId, setSelectedAudioAssetId] = useState("");
+  const [voiceFile, setVoiceFile] = useState<File | null>(null);
+  const [voiceProofNote, setVoiceProofNote] = useState("");
+  const [voiceAttested, setVoiceAttested] = useState(false);
+  const [voiceExpiry, setVoiceExpiry] = useState("");
   const [renderJob, setRenderJob] = useState<RenderJob | null>(null);
+  const [videoPreviewUrl, setVideoPreviewUrl] = useState("");
   const [publicationPackage, setPublicationPackage] = useState<PublicationPackage | null>(null);
   const [packagePreviewShown, setPackagePreviewShown] = useState(false);
 
@@ -466,10 +496,56 @@ function App() {
   }, [api, mode, renderJob?.id, renderJob?.status]);
 
   useEffect(() => {
+    if (mode !== "api" || renderJob?.status !== "succeeded") {
+      setVideoPreviewUrl("");
+      return;
+    }
+    let active = true;
+    let objectUrl = "";
+    void api.downloadRender(renderJob.id).then((blob) => {
+      if (!active) return;
+      objectUrl = URL.createObjectURL(blob);
+      setVideoPreviewUrl(objectUrl);
+    }).catch((requestError: unknown) => {
+      if (active) setError(errorMessage(requestError));
+    });
+    return () => {
+      active = false;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [api, mode, renderJob?.id, renderJob?.status]);
+
+  useEffect(() => {
     if (mode !== "api" || !project?.id) return;
     let active = true;
     api.listScripts(project.id).then((items) => {
       if (active) setVersions(items);
+    }).catch((requestError: unknown) => {
+      if (active) setError(errorMessage(requestError));
+    });
+    return () => { active = false; };
+  }, [api, mode, project?.id]);
+
+  useEffect(() => {
+    if (mode !== "api" || !run?.id) return;
+    let active = true;
+    void Promise.all([api.listGenerationResults(run.id), api.listRunCosts(run.id), project?.id ? api.listScripts(project.id) : Promise.resolve([])]).then(([results, costs, scripts]) => {
+      if (active) {
+        setGenerationResults(results);
+        setCostRecords(costs);
+        if (scripts.length) setVersions(scripts);
+      }
+    }).catch((requestError: unknown) => {
+      if (active) setRunStreamWarning(`生成记录暂不可用：${errorMessage(requestError)}`);
+    });
+    return () => { active = false; };
+  }, [api, mode, run?.id, run?.sequence, run?.status, project?.id]);
+
+  useEffect(() => {
+    if (mode !== "api" || !project?.id) return;
+    let active = true;
+    void api.listAudioAssets().then((items) => {
+      if (active) setAudioAssets(items);
     }).catch((requestError: unknown) => {
       if (active) setError(errorMessage(requestError));
     });
@@ -481,6 +557,9 @@ function App() {
     setCandidateDraft(EMPTY_CANDIDATE);
     setEvidenceDraft(EMPTY_EVIDENCE);
     setBriefDraft(EMPTY_BRIEF);
+    setFactRevisionValue("");
+    setFactRevisionNote("");
+    setFactRevisionStatus("unverified");
     setBook(null);
     setCandidate(null);
     setEvidence(null);
@@ -493,12 +572,21 @@ function App() {
     setEditorSegments([]);
     setRun(null);
     setEvents([]);
+    setGenerationResults([]);
+    setCostRecords([]);
     setRunStreamWarning("");
     setReviewDecision("approve");
     setReviewNote("");
     setReviewFlags({ fact: false, product: false, rights: false });
     setRenderRightsConfirmed(false);
+    setAudioAssets([]);
+    setSelectedAudioAssetId("");
+    setVoiceFile(null);
+    setVoiceProofNote("");
+    setVoiceAttested(false);
+    setVoiceExpiry("");
     setRenderJob(null);
+    setVideoPreviewUrl("");
     setPublicationPackage(null);
     setPackagePreviewShown(false);
     setEligibilityAttestation(false);
@@ -529,13 +617,17 @@ function App() {
       const latestRun = [...workspace.runs].sort((left, right) => Date.parse(right.updated_at) - Date.parse(left.updated_at))[0] ?? null;
       const latestRender = [...workspace.render_jobs].sort((left, right) => Date.parse(right.updated_at) - Date.parse(left.updated_at))[0] ?? null;
       const pendingVersion = [...orderedVersions].reverse().find((version) => version.review_status === "pending");
+      const approvedVersion = [...orderedVersions].reverse().find((version) => version.review_status === "approved");
       const selected = latestRun?.status === "waiting_review"
         ? pendingVersion ?? orderedVersions.at(-1)
         : latestRender
           ? orderedVersions.find((version) => version.id === latestRender.script_version_id) ?? orderedVersions.at(-1)
-          : orderedVersions.at(-1);
+          : approvedVersion ?? orderedVersions.at(-1);
 
       setBook(workspace.book);
+      setFactRevisionValue(workspace.book.facts[0]?.value ?? "");
+      setFactRevisionNote(workspace.book.facts[0]?.source_note ?? "");
+      setFactRevisionStatus(workspace.book.facts[0]?.verification_status ?? "unverified");
       setCandidate(workspace.promotion_candidate);
       setEvidence(workspace.evidence[0] ?? null);
       setWorkspaceEvidence(workspace.evidence);
@@ -543,9 +635,14 @@ function App() {
       setVersions(orderedVersions);
       setSelectedVersionId(selected?.id ?? "");
       setRun(latestRun);
+      if (!latestRun) {
+        setGenerationResults([]);
+        setCostRecords([]);
+      }
       setEvents([]);
       setRunStreamWarning("");
       setRenderJob(latestRender);
+      setSelectedAudioAssetId(latestRender?.audio_asset_id ?? "");
       setPublicationPackage(workspace.publication_package);
       setPackagePreviewShown(false);
       setBookDraft({
@@ -584,6 +681,7 @@ function App() {
         platform: workspace.project.target_platform,
         seconds: workspace.project.desired_seconds,
         angle: workspace.project.original_angle,
+        toneInstruction: workspace.project.tone_instruction ?? "",
         prohibitedClaims: workspace.project.prohibited_claims.join("，"),
       });
       setReviewDecision("approve");
@@ -644,6 +742,7 @@ function App() {
       platform: "douyin",
       seconds: 30,
       angle: "用自制地图图形表达一次小选择，邀请观众分享自己的方法。",
+      toneInstruction: "自然、克制，像与朋友交流",
       prohibitedClaims: "真实销量、疗效、保证改变人生",
     });
     setSuccess("已载入契约中的虚构人工样例。它没有真实商品或发布资格，操作只保存在本地演示状态。");
@@ -678,6 +777,9 @@ function App() {
         ? await api.createBook(payload)
         : { ...payload, id: makeId(), owner_user_id: makeId(), created_at: nowIso() };
       setBook(created);
+      setFactRevisionValue(created.facts[0]?.value ?? "");
+      setFactRevisionNote(created.facts[0]?.source_note ?? "");
+      setFactRevisionStatus(created.facts[0]?.verification_status ?? "unverified");
       setCandidate(null);
       setProject(null);
       setEvidence(null);
@@ -687,6 +789,33 @@ function App() {
       setPublicationPackage(null);
       setSuccess(mode === "api" ? "图书版本已由 API 保存。" : "图书版本已保存在本地演示状态。未向后端发送数据。");
       if (mode === "api") setLibraryReloadKey((value) => value + 1);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function reviseFact(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const current = book?.facts[0];
+    if (!book || !current || mode !== "api") return;
+    if (factRevisionStatus !== "unverified" && !factRevisionNote.trim()) {
+      setError("核实事实前请填写来源或本人核对说明；没有依据时保持未核实。");
+      return;
+    }
+    setBusy("fact");
+    setError("");
+    try {
+      const revision = await api.reviseBookFact(book.id, current.key, {
+        expected_revision: current.revision ?? 1,
+        value: factRevisionValue.trim(),
+        verification_status: factRevisionStatus,
+        source_note: factRevisionNote.trim() || null,
+        evidence_id: null,
+      });
+      setBook({ ...book, facts: book.facts.map((fact) => fact.key === current.key ? revision : fact) });
+      setSuccess(`事实“${current.key}”已追加修订 r${revision.revision}。已审核脚本仍保留原事实快照。`);
     } catch (requestError) {
       setError(errorMessage(requestError));
     } finally {
@@ -883,6 +1012,7 @@ function App() {
         target_platform: briefDraft.platform,
         desired_seconds: Number(briefDraft.seconds),
         original_angle: briefDraft.angle.trim(),
+        tone_instruction: briefDraft.toneInstruction.trim() || null,
         prohibited_claims: briefDraft.prohibitedClaims.split(/[，,\n]/).map((claim) => claim.trim()).filter(Boolean),
         evidence_ids: evidence ? [evidence.id] : [],
       };
@@ -913,6 +1043,8 @@ function App() {
       if (mode === "api") {
         const created = await api.startRun(project.id, { brief_version: 1 });
         setRun(created);
+        setGenerationResults([]);
+        setCostRecords([]);
         setEvents([]);
         setVersions(await api.listScripts(project.id));
         setSuccess("生成任务已提交。页面会读取 SSE 事件，并轮询当前任务状态。");
@@ -933,6 +1065,8 @@ function App() {
         };
         const sampleVersions = demoScriptVersions(project, book, briefDraft.angle);
         setRun(created);
+        setGenerationResults([]);
+        setCostRecords([]);
         setVersions(sampleVersions);
         setSelectedVersionId(sampleVersions[0]?.id ?? "");
         setEvents([
@@ -1001,6 +1135,9 @@ function App() {
       "run.cancel_requested": "已请求取消",
       "run.cancelled": "任务取消",
       "run.retry_requested": "已请求重试",
+      "run.generation_completed": "脚本生成完成",
+      "run.generation_failed": "脚本生成失败",
+      "run.cost_recorded": "费用已记录",
     };
     return labels[event.type];
   }
@@ -1065,12 +1202,17 @@ function App() {
     setBusy("render");
     setError("");
     try {
+      if (selectedAudioAssetId) {
+        const currentAudio = await api.getAudioAsset(selectedAudioAssetId);
+        if (!audioIsAllowed(currentAudio)) throw new Error("录音许可缺失或已过期，请选择静音或重新登记已许可录音。");
+      }
       const created = await api.startRender({
         project_id: project.id,
         script_version_id: selectedVersion.id,
         promotion_candidate_id: candidate.id,
         width: 1080,
         height: 1920,
+        audio_asset_id: selectedAudioAssetId || null,
         asset_rights: [
           { origin: "self_created_text", usage_status: "allowed", license_basis: "创作者原创文字", permitted_uses: ["render", "manual_publication"], proof_ref: null, expires_at: null },
           { origin: "self_created_graphic", usage_status: "allowed", license_basis: "自制图形", permitted_uses: ["render", "manual_publication"], proof_ref: null, expires_at: null },
@@ -1080,6 +1222,30 @@ function App() {
       setPublicationPackage(null);
       setPackagePreviewShown(false);
       setSuccess("渲染任务已提交。任务状态由 API 返回。");
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function uploadVoice(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (mode !== "api" || !voiceFile || !voiceAttested || !voiceProofNote.trim()) return;
+    setBusy("audio");
+    setError("");
+    try {
+      const bytes = await voiceFile.arrayBuffer();
+      const digest = await crypto.subtle.digest("SHA-256", bytes);
+      const sha256 = [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+      const asset = await api.uploadAudioAsset({ file: voiceFile, sha256, rights_proof_note: voiceProofNote.trim(), expires_at: dateInputToIso(voiceExpiry) });
+      setAudioAssets(await api.listAudioAssets());
+      if (audioIsAllowed(asset)) setSelectedAudioAssetId(asset.id);
+      setVoiceFile(null);
+      setVoiceProofNote("");
+      setVoiceAttested(false);
+      setVoiceExpiry("");
+      setSuccess(audioIsAllowed(asset) ? "本人录音已通过服务端媒体与许可校验，可用于当前项目。" : "录音已登记，但当前许可状态为阻止，不能用于渲染。");
     } catch (requestError) {
       setError(errorMessage(requestError));
     } finally {
@@ -1169,6 +1335,8 @@ function App() {
   const canApprove = reviewFlagsComplete && factsHaveSources && candidateIsManuallyConfirmed;
   const approvedVersion = versions.find((version) => version.review_status === "approved") ?? null;
   const selectedVersionApproved = selectedVersion?.review_status === "approved";
+  const selectedAudioAsset = audioAssets.find((asset) => asset.id === selectedAudioAssetId) ?? null;
+  const selectedAudioAllowed = !selectedAudioAssetId || Boolean(selectedAudioAsset && audioIsAllowed(selectedAudioAsset));
   const filteredLibraryProjects = libraryProjects.filter((item) => {
     const query = navigatorSearch.trim().toLocaleLowerCase();
     if (!query) return true;
@@ -1341,6 +1509,17 @@ function App() {
                     <div className="form-actions span-2"><button className="button button-primary" disabled={Boolean(book) || busy === "book"} type="submit">{busy === "book" ? "保存中…" : book ? "图书版本已保存" : "保存图书版本"}<span>→</span></button><span>图书封面、内文和商品图不会显示在本页或进入演示成片。</span></div>
                   </form>
 
+                  {book && <div className="fact-revision-panel">
+                    <h3>事实出处与修订</h3>
+                    <p>当前 {book.facts[0]?.key || "事实"} · r{book.facts[0]?.revision ?? 1} · {book.facts[0]?.verification_status === "unverified" ? "未核实，不能用于成片" : "有核对依据"}</p>
+                    {mode === "api" && book.facts[0] && <form className="form-grid" onSubmit={reviseFact}>
+                      <Field label="修订内容" required><input onChange={(event) => setFactRevisionValue(event.target.value)} required value={factRevisionValue} /></Field>
+                      <Field label="核实状态"><select onChange={(event) => setFactRevisionStatus(event.target.value as BookDraft["factStatus"])} value={factRevisionStatus}><option value="unverified">未核实</option><option value="source_verified">有来源核实</option><option value="human_confirmed">本人已确认</option></select></Field>
+                      <div className="span-2"><Field label="来源或本人核对说明"><input onChange={(event) => setFactRevisionNote(event.target.value)} placeholder="说明本次修订的来源、范围或缺失原因" value={factRevisionNote} /></Field></div>
+                      <div className="form-actions span-2"><button className="button button-secondary" disabled={busy === "fact"} type="submit">{busy === "fact" ? "保存中…" : "追加事实修订"}</button><span>修订不会改写已审核脚本的事实快照。</span></div>
+                    </form>}
+                  </div>}
+
                   <div className="section-divider" />
                   <div className="form-section-title"><span className="section-index">B</span><div><h2>拟挂商品</h2><p>记录商品链接与平台，资格状态默认未核实。</p></div>{candidate && <span className={`status-pill ${candidate.eligibility_status === "manually_confirmed" ? "status-verified" : "status-pending"}`}>{candidate.eligibility_status === "manually_confirmed" ? "本人记录已核对" : "未核实"}</span>}</div>
                   {candidate && <div className="saved-record candidate-record"><span className="saved-icon">◇</span><div><strong>{candidate.platform_product_id}</strong><p>{platformName(candidate.platform)} · {candidate.eligibility_note || "没有核验说明"}</p></div><small>{candidate.eligibility_status === "manually_confirmed" ? "人工记录" : "待人工核对"}</small></div>}
@@ -1374,6 +1553,7 @@ function App() {
                         <Field label="目标平台" required><select disabled={Boolean(project)} onChange={(event) => setBriefDraft({ ...briefDraft, platform: event.target.value as Platform })} value={briefDraft.platform}><option value="douyin">抖音</option><option value="kuaishou">快手</option></select></Field>
                         <Field label="目标时长" required><select disabled={Boolean(project)} onChange={(event) => setBriefDraft({ ...briefDraft, seconds: Number(event.target.value) })} value={briefDraft.seconds}><option value={20}>20 秒</option><option value={25}>25 秒</option><option value={30}>30 秒</option><option value={35}>35 秒</option><option value={40}>40 秒</option><option value={45}>45 秒</option></select></Field>
                         <Field label="原创角度" required><textarea disabled={Boolean(project)} onChange={(event) => setBriefDraft({ ...briefDraft, angle: event.target.value })} placeholder="用一句话描述你想讲的观点" required rows={3} value={briefDraft.angle} /></Field>
+                        <div className="field span-2"><label>语气指引（可选）</label><input disabled={Boolean(project)} maxLength={500} onChange={(event) => setBriefDraft({ ...briefDraft, toneInstruction: event.target.value })} placeholder="例如：像向朋友推荐一样自然，不夸大结论" value={briefDraft.toneInstruction} /></div>
                         <div className="field span-2"><label>禁止出现的表述</label><textarea disabled={Boolean(project)} onChange={(event) => setBriefDraft({ ...briefDraft, prohibitedClaims: event.target.value })} placeholder="用逗号分隔，例如：疗效、保证结果、未核实销量" rows={2} value={briefDraft.prohibitedClaims} /></div>
                         <div className="form-actions span-2"><button className="button button-primary" disabled={Boolean(project) || busy === "project"} type="submit">{busy === "project" ? "保存中…" : project ? "Brief 已创建" : "创建创作 Brief"}<span>→</span></button><span>创建后契约当前没有 Brief 修改接口。</span></div>
                       </form>
@@ -1410,6 +1590,14 @@ function App() {
                       </div>
                       {mode === "demo" && <div className="inline-warning"><span>!</span><p>演示脚本由本地模板生成，仅用于体验版本与审核界面；没有模型调用，也没有引用书籍内文。</p></div>}
                       {mode === "api" && runStreamWarning && <div className="inline-warning"><span>↻</span><p>{runStreamWarning} 可继续查看状态页。</p></div>}
+                      {run && mode === "api" && <section className="generation-records" aria-label="生成与费用记录">
+                        <div className="versions-header"><div><h2>生成与费用</h2><p>按当前任务读取服务端实际记录。金额未知时保留缺失原因。</p></div></div>
+                        {generationResults.length ? generationResults.map((result) => <article className="generation-record" key={result.id}>
+                          <strong>{result.status === "succeeded" ? "生成完成" : "生成失败"} · {result.source === "deterministic_fixture" ? "本地确定性样稿" : `${result.provider_key} / ${result.model_key}`}</strong>
+                          <small>第 {result.attempt} 轮 · {formatTime(result.created_at)} · {result.script_version_id ? `脚本 ${shortId(result.script_version_id)}` : `原因 ${result.reason_code || "未提供"}`}</small>
+                          <small>{costRecords.filter((cost) => cost.generation_result_id === result.id).map(formatCost).join("；") || "费用记录尚未返回"}</small>
+                        </article>) : <p className="muted-copy">暂无生成记录；任务进行中时会自动刷新。</p>}
+                      </section>}
 
                       <div className="versions-header"><div><h2>脚本版本</h2><p>选择一个版本查看或编辑。</p></div><span className="version-count">{versions.length} 版</span></div>
                       {versions.length === 0 ? (
@@ -1423,9 +1611,18 @@ function App() {
                           ))}
                         </div>
                       )}
+                      {versions.length >= 2 && <div className="script-comparison" aria-label="两版脚本对照">
+                        {[...versions].slice(0, 2).map((version) => <article className={`comparison-card ${selectedVersionId === version.id ? "is-selected" : ""}`} key={version.id}>
+                          <div><strong>方案 v{version.version_number}</strong><ReviewPill status={version.review_status} /></div>
+                          <h3>{version.title_suggestion}</h3>
+                          <p>{version.description_suggestion}</p>
+                          <ol>{version.segments.map((segment) => <li key={segment.order}><b>{segment.onscreen_text}</b><span>{segment.narration}</span><small>{segment.duration_seconds} 秒 · 事实键 {segment.fact_keys.join("、") || "无"}</small></li>)}</ol>
+                          <button className="button button-secondary" onClick={() => setSelectedVersionId(version.id)} type="button">{selectedVersionId === version.id ? "当前选中审核版" : "选择这版改稿 / 审核"}</button>
+                        </article>)}
+                      </div>}
                       {selectedVersion && (
                         <form className="script-editor" onSubmit={saveScript}>
-                          <div className="editor-heading"><div><span className="eyebrow">SCRIPT EDITOR</span><h2>编辑 v{selectedVersion.version_number}</h2><p>保存会创建下一版，不会覆盖当前版本。</p></div><ReviewPill status={selectedVersion.review_status} /></div>
+                          <div className="editor-heading"><div><span className="eyebrow">SCRIPT EDITOR</span><h2>选中审核版 v{selectedVersion.version_number}</h2><p>保存会创建下一版，不会覆盖当前版本。生成来源 {selectedVersion.generation_result_id ? shortId(selectedVersion.generation_result_id) : "人工改稿 / 旧版"}。</p><p>事实快照：{selectedVersion.fact_revision_refs?.length ? selectedVersion.fact_revision_refs.map((ref) => `${ref.key} r${ref.revision}`).join("、") : "无引用事实"}</p></div><ReviewPill status={selectedVersion.review_status} /></div>
                           <Field label="标题建议" required><input onChange={(event) => setEditorTitle(event.target.value)} required value={editorTitle} /></Field>
                           <Field label="简介建议" required><textarea onChange={(event) => setEditorDescription(event.target.value)} required rows={2} value={editorDescription} /></Field>
                           <div className="segments-heading"><div><h3>镜头文字与旁白</h3><p>只写原创表达；事实键须来自已记录的事实。</p></div><span>{currentDuration} 秒</span></div>
@@ -1435,6 +1632,7 @@ function App() {
                                 <div className="segment-top"><span className="segment-index">{String(index + 1).padStart(2, "0")}</span><span>文字段落</span><label>时长 <input aria-label={`第 ${index + 1} 段时长`} min="0.1" onChange={(event) => setEditorSegments((existing) => existing.map((item, itemIndex) => itemIndex === index ? { ...item, duration_seconds: Number(event.target.value) } : item))} step="0.1" type="number" value={segment.duration_seconds} /> 秒</label><button aria-label={`删除第 ${index + 1} 段`} disabled={editorSegments.length <= 1} onClick={() => setEditorSegments((existing) => existing.filter((_, itemIndex) => itemIndex !== index).map((item, itemIndex) => ({ ...item, order: itemIndex })))} type="button">×</button></div>
                                 <Field label="屏幕文字"><input onChange={(event) => setEditorSegments((existing) => existing.map((item, itemIndex) => itemIndex === index ? { ...item, onscreen_text: event.target.value } : item))} value={segment.onscreen_text} /></Field>
                                 <Field label="旁白"><textarea onChange={(event) => setEditorSegments((existing) => existing.map((item, itemIndex) => itemIndex === index ? { ...item, narration: event.target.value } : item))} rows={2} value={segment.narration} /></Field>
+                                <Field label="引用事实键（逗号分隔）"><input onChange={(event) => setEditorSegments((existing) => existing.map((item, itemIndex) => itemIndex === index ? { ...item, fact_keys: event.target.value.split(/[，,]/).map((key) => key.trim()).filter(Boolean) } : item))} placeholder="仅使用上方有依据的事实键" value={segment.fact_keys.join("，")} /></Field>
                               </article>
                             ))}
                           </div>
@@ -1500,12 +1698,26 @@ function App() {
                       ) : (
                         <div className="render-box">
                           <div className="render-box-head"><div className="render-glyph">▧</div><div><strong>{renderJob ? `渲染 ${shortId(renderJob.id)}` : "竖屏文字动效成片"}</strong><small>{renderJob ? `${statusName(renderJob.status)} · 第 ${renderJob.attempt} 轮 · 更新于 ${formatTime(renderJob.updated_at)}${renderJob.error_message ? ` · ${renderJob.error_message}` : ""}` : "1080 × 1920 · 使用审核通过的脚本"}</small></div>{renderJob && <span className={`run-pill ${renderJob.status}`}>{statusName(renderJob.status)}</span>}</div>
+                          <div className="audio-panel">
+                            <div className="versions-header"><div><h2>声音方案</h2><p>可选择静音或已由服务端核验的本人录音。录音文件只上传给当前 API，不把本地路径交给 worker。</p></div></div>
+                            <Field label="本次成片的声音"><select onChange={(event) => setSelectedAudioAssetId(event.target.value)} value={selectedAudioAssetId}><option value="">静音（成片无音轨）</option>{audioAssets.map((asset) => <option disabled={!audioIsAllowed(asset)} key={asset.id} value={asset.id}>{asset.origin === "self_recorded_voice" ? "本人录音" : "已许可声音"} · {Math.round(asset.duration_ms / 1000)} 秒 · {shortId(asset.id)}{audioIsAllowed(asset) ? "" : " · 许可不可用"}</option>)}</select></Field>
+                            {selectedAudioAsset && <p className={selectedAudioAllowed ? "muted-copy" : "blocked-hint"}>许可：{selectedAudioAsset.usage_status === "allowed" ? "服务端允许" : "服务端阻止"} · {selectedAudioAsset.rights_proof_note} · 到期 {selectedAudioAsset.expires_at ? formatTime(selectedAudioAsset.expires_at) : "未设期限"}{selectedAudioAllowed ? "" : "；请改用静音或登记有效录音"}</p>}
+                            <form className="voice-upload" onSubmit={uploadVoice}>
+                              <h3>上传本人录音</h3>
+                              <Field label="音频文件"><input accept="audio/wav,audio/mpeg,audio/mp4,.wav,.mp3,.m4a" onChange={(event) => setVoiceFile(event.target.files?.[0] ?? null)} type="file" /></Field>
+                              <Field label="录音权利说明"><input maxLength={1000} onChange={(event) => setVoiceProofNote(event.target.value)} placeholder="例如：本人录制并同意用于本项目成片及手动发布" value={voiceProofNote} /></Field>
+                              <Field label="许可到期日（可选）"><input onChange={(event) => setVoiceExpiry(event.target.value)} type="date" value={voiceExpiry} /></Field>
+                              <label className="attestation"><input checked={voiceAttested} onChange={(event) => setVoiceAttested(event.target.checked)} type="checkbox" /><span>我确认这是本人录音，且同意用于成片与本人手动发布。</span></label>
+                              <button className="button button-secondary" disabled={busy === "audio" || !voiceFile || !voiceProofNote.trim() || !voiceAttested} type="submit">{busy === "audio" ? "上传校验中…" : "上传并校验录音"}</button>
+                            </form>
+                          </div>
                           <label className="attestation render-attestation"><input checked={renderRightsConfirmed} onChange={(event) => setRenderRightsConfirmed(event.target.checked)} type="checkbox" /><span><strong>我确认本次使用的文字为原创内容，自制图形可用于本次渲染。</strong><small>默认静音；无许可凭据的外部图片、音乐、肖像和声音不会进入成片。</small></span></label>
                           {renderJob?.cancel_requested_at && <p className="task-action-note">已请求取消渲染，等待 worker 确认停止。</p>}
                           {renderJob && mode === "api" && ["queued", "running"].includes(renderJob.status) && !renderJob.cancel_requested_at && <div className="render-cancel-row"><Field label="取消原因（可选）"><input onChange={(event) => setCancelReason(event.target.value)} placeholder="例如：先修订审核脚本" value={cancelReason} /></Field><button className="button button-danger" disabled={busy === "cancel-render"} onClick={() => void cancelCurrentRender()} type="button">{busy === "cancel-render" ? "取消请求中…" : "取消渲染"}<span>×</span></button></div>}
-                          <div className="render-box-actions"><button className="button button-primary" disabled={busy === "render" || !selectedVersionApproved || !renderRightsConfirmed || !candidateIsManuallyConfirmed || Boolean(renderJob && ["queued", "running"].includes(renderJob.status))} onClick={() => void startRender()} type="button">{busy === "render" ? "提交中…" : renderJob && ["queued", "running"].includes(renderJob.status) ? "渲染进行中" : renderJob?.status === "failed" ? "另建渲染任务" : renderJob?.status === "succeeded" ? "另建渲染任务" : "提交渲染"}<span>→</span></button>{renderJob?.status === "failed" && <button className="button button-secondary" disabled={busy === "retry-render"} onClick={() => void retryCurrentRender()} type="button">{busy === "retry-render" ? "提交中…" : `重试原任务（第 ${renderJob.attempt + 1} 轮）`}<span>↻</span></button>}<span>{!selectedVersionApproved ? "选择一版审核通过的脚本。" : !candidateIsManuallyConfirmed ? "先记录平台客户端人工核对。" : "仅提交给 API，不会发布到平台。"}</span></div>
+                          <div className="render-box-actions"><button className="button button-primary" disabled={busy === "render" || !selectedVersionApproved || !renderRightsConfirmed || !candidateIsManuallyConfirmed || !selectedAudioAllowed || Boolean(renderJob && ["queued", "running"].includes(renderJob.status))} onClick={() => void startRender()} type="button">{busy === "render" ? "提交中…" : renderJob && ["queued", "running"].includes(renderJob.status) ? "渲染进行中" : renderJob?.status === "failed" ? "另建渲染任务" : renderJob?.status === "succeeded" ? "另建渲染任务" : "提交渲染"}<span>→</span></button>{renderJob?.status === "failed" && <button className="button button-secondary" disabled={busy === "retry-render"} onClick={() => void retryCurrentRender()} type="button">{busy === "retry-render" ? "提交中…" : `重试原任务（第 ${renderJob.attempt + 1} 轮）`}<span>↻</span></button>}<span>{!selectedVersionApproved ? "选择一版审核通过的脚本。" : !candidateIsManuallyConfirmed ? "先记录平台客户端人工核对。" : !selectedAudioAllowed ? "所选录音许可不可用。" : "仅提交给 API，不会发布到平台。"}</span></div>
                         </div>
                       )}
+                      {mode === "api" && videoPreviewUrl && <div className="video-preview"><h3>私有成片预览</h3><video controls playsInline src={videoPreviewUrl} /><small>预览使用当前所有者权限取得的已完成 MP4；最终仍需自行在平台客户端核验。</small></div>}
 
                       <div className="package-toolbar"><div><span className="eyebrow">MANUAL CHECKLIST</span><h2>发布前人工核对</h2><p>以服务端返回的状态为准。平台资格和挂车结果需你在平台后台确认。</p></div><div className="package-buttons"><button className="button button-secondary" disabled={busy === "package" || (mode === "api" && renderJob?.status !== "succeeded")} onClick={() => void loadPublicationPackage()} type="button">{busy === "package" ? "加载中…" : packagePreviewShown || publicationPackage ? "刷新核对卡" : mode === "demo" ? "展示演示核对卡" : "加载发布包"}<span>↻</span></button>{publicationPackage && <button className="button button-muted" onClick={downloadPackageJson} type="button">下载核对卡 JSON <span>↓</span></button>}</div></div>
                       {mode === "api" && renderJob?.status !== "succeeded" && <div className="inline-warning"><span>!</span><p>API 尚未返回渲染完成状态，发布包不会标记为可下载。审核通过并完成渲染后再加载。</p></div>}

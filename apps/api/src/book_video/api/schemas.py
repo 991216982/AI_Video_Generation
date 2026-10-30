@@ -13,7 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 
 class StrictModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, protected_namespaces=())
 
 
 class Platform(str, Enum):
@@ -33,6 +33,21 @@ class BookFact(StrictModel):
     verification_status: VerificationStatus
     source_note: str | None = None
     evidence_id: UUID | None = None
+    revision: int = Field(default=1, ge=1)
+
+
+class BookFactRevisionRequest(StrictModel):
+    expected_revision: int = Field(ge=1)
+    value: str = Field(min_length=1)
+    verification_status: VerificationStatus
+    source_note: str | None = Field(default=None, max_length=1000)
+    evidence_id: UUID | None = None
+
+
+class BookFactRevision(BookFact):
+    book_id: UUID
+    created_at: datetime
+    created_by_user_id: UUID
 
 
 class BookCreate(StrictModel):
@@ -66,8 +81,8 @@ class PromotionCandidateCreate(StrictModel):
     platform: Platform
     platform_product_id: str = Field(min_length=1)
     product_url: str = Field(min_length=1)
-    eligibility_status: EligibilityStatus = EligibilityStatus.UNVERIFIED
-    eligibility_checked_at: datetime | None = None
+    eligibility_status: Literal[EligibilityStatus.UNVERIFIED] = EligibilityStatus.UNVERIFIED
+    eligibility_checked_at: None = None
     eligibility_note: str | None = None
 
     @field_validator("product_url")
@@ -76,24 +91,9 @@ class PromotionCandidateCreate(StrictModel):
         _validate_web_uri(value, "product_url")
         return value
 
-    @field_validator("eligibility_checked_at")
-    @classmethod
-    def checked_at_must_include_timezone(
-        cls, value: datetime | None
-    ) -> datetime | None:
-        return _timezone_aware(value)
-
-    @model_validator(mode="after")
-    def confirmed_eligibility_has_manual_check(self) -> PromotionCandidateCreate:
-        if self.eligibility_status == EligibilityStatus.MANUALLY_CONFIRMED:
-            if self.eligibility_checked_at is None or not self.eligibility_note:
-                raise ValueError(
-                    "manual confirmation requires eligibility_checked_at and eligibility_note"
-                )
-        return self
-
-
 class PromotionCandidate(PromotionCandidateCreate):
+    eligibility_status: EligibilityStatus
+    eligibility_checked_at: datetime | None = None
     id: UUID
     owner_user_id: UUID
     created_at: datetime
@@ -180,6 +180,7 @@ class CreativeProjectCreate(StrictModel):
     original_angle: str = Field(min_length=1)
     prohibited_claims: list[str] = Field(default_factory=list)
     evidence_ids: list[UUID] = Field(default_factory=list)
+    tone_instruction: str | None = None
 
 
 class CreativeProject(CreativeProjectCreate):
@@ -221,7 +222,54 @@ class ScriptVersion(ScriptVersionCreate):
     owner_user_id: UUID
     version_number: int = Field(ge=1)
     review_status: Literal["pending", "approved", "rejected"]
+    generation_result_id: UUID | None = None
+    fact_revision_refs: list[dict[str, int | str]] = Field(default_factory=list)
     created_at: datetime
+
+
+class AudioAsset(StrictModel):
+    id: UUID
+    owner_user_id: UUID
+    origin: Literal["self_recorded_voice", "licensed_voice"]
+    sha256: str
+    mime_type: Literal["audio/wav", "audio/mpeg", "audio/mp4"]
+    duration_ms: int = Field(ge=1, le=45000)
+    rights_attested: bool
+    rights_proof_note: str
+    permitted_uses: Literal["render_and_manual_publish"]
+    expires_at: datetime | None
+    usage_status: Literal["allowed", "blocked"]
+    created_at: datetime
+
+
+class GenerationResult(StrictModel):
+    id: UUID
+    run_id: UUID
+    owner_user_id: UUID
+    attempt: int = Field(ge=1)
+    invocation_key: str
+    source: Literal["deterministic_fixture", "external_model"]
+    provider_key: str
+    model_key: str
+    status: Literal["succeeded", "failed"]
+    reason_code: str | None
+    input_digest: str
+    output_digest: str | None
+    script_version_id: UUID | None
+    created_at: datetime
+
+
+class ModelCostRecord(StrictModel):
+    id: UUID
+    run_id: UUID
+    owner_user_id: UUID
+    generation_result_id: UUID
+    currency: str
+    amount_minor: int | None = Field(ge=0)
+    missing_reason: str | None
+    input_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
+    recorded_at: datetime
 
 
 class RunCreate(StrictModel):
@@ -285,6 +333,7 @@ class RenderCreate(StrictModel):
     promotion_candidate_id: UUID
     width: Literal[1080]
     height: Literal[1920]
+    audio_asset_id: UUID | None = None
     asset_rights: list[AssetRights] = Field(min_length=1)
 
 
@@ -292,6 +341,7 @@ class RenderJob(StrictModel):
     id: UUID
     project_id: UUID
     script_version_id: UUID
+    audio_asset_id: UUID | None = None
     owner_user_id: UUID
     status: Literal[
         "queued", "running", "waiting_review", "succeeded", "failed", "cancelled"

@@ -52,6 +52,8 @@ def generation_snapshot(*, eligibility: str = "manually_confirmed") -> dict[str,
                     "key": "title",
                     "value": "把日子写成地图",
                     "verification_status": "human_confirmed",
+                    "source_note": "虚构演示数据，已由创作者人工核对",
+                    "revision": 1,
                 },
                 {
                     "key": "unverified_note",

@@ -69,6 +69,21 @@ def _candidate_body(book_id: str, *, confirmed=True) -> dict:
     }
 
 
+def _confirmed_candidate(client: TestClient, book_id: str) -> dict:
+    created = client.post(
+        "/api/v1/promotion-candidates", json=_candidate_body(book_id, confirmed=False)
+    )
+    assert created.status_code == 201, created.text
+    candidate = created.json()
+    confirmed = client.patch(
+        f"/api/v1/promotion-candidates/{candidate['id']}/eligibility",
+        json={"eligibility_status": "manually_confirmed", "expected_revision": 1,
+              "eligibility_note": "虚构演示：本人账号后台核对", "confirmation_basis": "creator_account_backend"},
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    return confirmed.json()
+
+
 def _project_body(book_id: str, candidate_id: str) -> dict:
     return {
         "book_id": book_id,
@@ -117,11 +132,7 @@ def _ready_flow(client: TestClient) -> tuple[dict, dict, dict, dict, dict]:
     assert book_response.status_code == 201, book_response.text
     book = book_response.json()
 
-    candidate_response = client.post(
-        "/api/v1/promotion-candidates", json=_candidate_body(book["id"])
-    )
-    assert candidate_response.status_code == 201, candidate_response.text
-    candidate = candidate_response.json()
+    candidate = _confirmed_candidate(client, book["id"])
 
     project_response = client.post(
         "/api/v1/creative-projects",
@@ -397,9 +408,7 @@ def test_worker_entry_points_claim_queue_and_replay_run_events_idempotently(tmp_
     client, service, _ = _app(tmp_path)
     client.app.state.domain_service = service
     book = client.post("/api/v1/books", json=_book_body()).json()
-    candidate = client.post(
-        "/api/v1/promotion-candidates", json=_candidate_body(book["id"])
-    ).json()
+    candidate = _confirmed_candidate(client, book["id"])
     project = client.post(
         "/api/v1/creative-projects",
         json=_project_body(book["id"], candidate["id"]),
@@ -468,9 +477,7 @@ def test_worker_entry_points_claim_queue_and_replay_run_events_idempotently(tmp_
 def test_generated_script_persistence_keeps_stable_identity_and_review_state(tmp_path) -> None:
     client, service, _ = _app(tmp_path)
     book = client.post("/api/v1/books", json=_book_body()).json()
-    candidate = client.post(
-        "/api/v1/promotion-candidates", json=_candidate_body(book["id"])
-    ).json()
+    candidate = _confirmed_candidate(client, book["id"])
     project = client.post(
         "/api/v1/creative-projects",
         json=_project_body(book["id"], candidate["id"]),
@@ -515,6 +522,7 @@ def test_sqlite_migration_survives_database_reopen(tmp_path) -> None:
         "001_initial",
         "002_w2_reliability",
         "003_render_execution_lease",
+        "004_w3_generation_audio",
     ]
 
 
@@ -587,9 +595,7 @@ def test_books_projects_and_workspace_are_stable_owner_scoped_and_reopenable(tmp
     book_body = _book_body()
     book_body["facts"][0]["evidence_id"] = evidence["id"]
     book = client.post("/api/v1/books", json=book_body).json()
-    candidate = client.post(
-        "/api/v1/promotion-candidates", json=_candidate_body(book["id"])
-    ).json()
+    candidate = _confirmed_candidate(client, book["id"])
     project_body = _project_body(book["id"], candidate["id"])
     project_body["evidence_ids"] = [evidence["id"]]
     projects = [
@@ -758,9 +764,7 @@ def test_eligibility_revision_conflict_revocation_and_manual_update(tmp_path) ->
 def test_cancel_and_retry_run_are_idempotent_and_attempted(tmp_path) -> None:
     client, service, _ = _app(tmp_path)
     book = client.post("/api/v1/books", json=_book_body()).json()
-    candidate = client.post(
-        "/api/v1/promotion-candidates", json=_candidate_body(book["id"])
-    ).json()
+    candidate = _confirmed_candidate(client, book["id"])
     project = client.post(
         "/api/v1/creative-projects",
         json=_project_body(book["id"], candidate["id"]),
@@ -867,9 +871,7 @@ def test_running_cancellation_is_persisted_and_worker_must_confirm(tmp_path) -> 
 def test_running_run_can_be_reclaimed_after_execution_lease_expires(tmp_path) -> None:
     client, service, _ = _app(tmp_path)
     book = client.post("/api/v1/books", json=_book_body()).json()
-    candidate = client.post(
-        "/api/v1/promotion-candidates", json=_candidate_body(book["id"])
-    ).json()
+    candidate = _confirmed_candidate(client, book["id"])
     project = client.post(
         "/api/v1/creative-projects",
         json=_project_body(book["id"], candidate["id"]),
@@ -993,7 +995,7 @@ def test_render_cancel_retry_and_eligibility_are_rechecked_at_claim_and_completi
         f"/api/v1/promotion-candidates/{candidate['id']}/eligibility",
         json={
             "eligibility_status": "unverified",
-            "expected_revision": 1,
+            "expected_revision": candidate["eligibility_revision"],
             "eligibility_note": None,
             "confirmation_basis": None,
         },
@@ -1006,7 +1008,7 @@ def test_render_cancel_retry_and_eligibility_are_rechecked_at_claim_and_completi
         f"/api/v1/promotion-candidates/{candidate['id']}/eligibility",
         json={
             "eligibility_status": "manually_confirmed",
-            "expected_revision": 2,
+            "expected_revision": revoked.json()["eligibility_revision"],
             "eligibility_note": "虚构演示：重新人工核对",
             "confirmation_basis": "creator_account_backend",
         },
@@ -1022,7 +1024,7 @@ def test_render_cancel_retry_and_eligibility_are_rechecked_at_claim_and_completi
         f"/api/v1/promotion-candidates/{candidate['id']}/eligibility",
         json={
             "eligibility_status": "unverified",
-            "expected_revision": 3,
+            "expected_revision": confirmed.json()["eligibility_revision"],
             "eligibility_note": None,
             "confirmation_basis": None,
         },
@@ -1043,7 +1045,7 @@ def test_render_cancel_retry_and_eligibility_are_rechecked_at_claim_and_completi
         f"/api/v1/promotion-candidates/{candidate['id']}/eligibility",
         json={
             "eligibility_status": "manually_confirmed",
-            "expected_revision": 4,
+            "expected_revision": revoked_again.json()["eligibility_revision"],
             "eligibility_note": "虚构演示：再次人工核对",
             "confirmation_basis": "creator_account_backend",
         },
@@ -1256,6 +1258,6 @@ def test_003_upgrades_database_where_original_002_is_already_applied(tmp_path) -
         ]
     assert "execution_claimed_at" in columns_after
     assert "idx_render_jobs_execution_lease" in indexes
-    assert versions == ["001_initial", "002_w2_reliability", "003_render_execution_lease"]
+    assert versions == ["001_initial", "002_w2_reliability", "003_render_execution_lease", "004_w3_generation_audio"]
     service = DomainService(database, owner_user_id=OWNER_ID)
     assert service.claim_next_resumable_render() is None

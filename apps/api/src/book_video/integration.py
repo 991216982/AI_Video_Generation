@@ -34,17 +34,32 @@ def _event_adapter(service: DomainService, run_id: str, *, resuming: bool):
         # interrupt request on resume; the persisted request is authoritative.
         if kind in {"run.created", "run.reviewed"} or (resuming and kind == "run.review_requested"):
             return
+        if kind in {"run.generation_completed", "run.generation_failed", "run.cost_recorded"}:
+            # A recovered graph may replay a persisted invocation before its
+            # checkpoint catches up. Keep one event per actual result/cost.
+            if any(
+                item["type"] == kind
+                and item.get("generation_result_id") == event.get("generation_result_id")
+                and item.get("cost_record_id") == event.get("cost_record_id")
+                for item in service.list_run_events(run_id)
+            ):
+                return
         current = service.get_run(run_id)
         if current["status"] in {"succeeded", "failed", "cancelled"}:
             return
         target_status, target_stage = str(event["status"]), str(event["stage"])
         if (current["status"], current["stage"]) == (target_status, target_stage):
-            if kind == "run.review_requested":
+            if kind in {
+                "run.review_requested",
+                "run.generation_completed",
+                "run.generation_failed",
+                "run.cost_recorded",
+            }:
                 sequence = current["sequence"] + 1
                 service.persist_run_event(
                     {
                         **event,
-                        "event_id": str(uuid5(NAMESPACE_URL, f"book-video:{run_id}:review-request:{sequence}")),
+                        "event_id": str(uuid5(NAMESPACE_URL, f"book-video:{run_id}:{kind}:{sequence}")),
                         "sequence": sequence,
                         "occurred_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
                     }
@@ -66,6 +81,13 @@ def _event_adapter(service: DomainService, run_id: str, *, resuming: bool):
 def _script_adapter(service: DomainService, project_id: str):
     def persist(script: Mapping[str, Any]) -> None:
         service.persist_generated_script_version(project_id, script)
+
+    return persist
+
+
+def _generation_adapter(service: DomainService):
+    def persist(result: Mapping[str, Any], cost: Mapping[str, Any]) -> dict[str, Any]:
+        return service.persist_generation(result, cost)
 
     return persist
 
@@ -148,6 +170,7 @@ def process_queued_run(service: DomainService) -> bool:
             checkpointer=saver,
             emit_event=_event_adapter(service, run_id, resuming=False),
             persist_script=_script_adapter(service, project_id),
+            persist_generation=_generation_adapter(service),
             cancel_check=lambda: service.is_run_cancel_requested(run_id),
         )
     except WorkflowCancelledError as error:
@@ -182,6 +205,7 @@ def process_resumable_run(service: DomainService) -> bool:
                 checkpointer=saver,
                 emit_event=_event_adapter(service, run_id, resuming=False),
                 persist_script=_script_adapter(service, project_id),
+                persist_generation=_generation_adapter(service),
                 cancel_check=lambda: service.is_run_cancel_requested(run_id),
             )
         else:
@@ -189,6 +213,7 @@ def process_resumable_run(service: DomainService) -> bool:
                 checkpointer=saver,
                 emit_event=_event_adapter(service, run_id, resuming=False),
                 persist_script=_script_adapter(service, project_id),
+                persist_generation=_generation_adapter(service),
                 cancel_check=lambda: service.is_run_cancel_requested(run_id),
             )
             graph.invoke(None, config=config)
@@ -234,6 +259,7 @@ def process_reviewed_run(service: DomainService) -> bool:
             review_decision=decision,
             emit_event=_event_adapter(service, run_id, resuming=True),
             persist_script=_script_adapter(service, project_id),
+            persist_generation=_generation_adapter(service),
             cancel_check=lambda: service.is_run_cancel_requested(run_id),
         )
         if result.get("waiting_for_review") or result.get("review_gate_error"):
@@ -262,6 +288,7 @@ def _process_claimed_render(service: DomainService, render: Mapping[str, Any]) -
             output_dir=service.render_output_dir,
             attempt=render["attempt"],
             idempotency_store=_render_store(service),
+            audio_resolver=lambda audio_asset_id: service.get_audio_asset_media(audio_asset_id),
             cancel_check=lambda: service.is_render_cancel_requested(render_id),
         )
         if result["status"] == "succeeded":

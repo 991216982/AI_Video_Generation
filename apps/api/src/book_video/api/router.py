@@ -6,7 +6,7 @@ import json
 from typing import Callable
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, BackgroundTasks, Header, Query, Request
+from fastapi import APIRouter, BackgroundTasks, File, Form, Header, Query, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.routing import APIRoute
@@ -15,6 +15,9 @@ from book_video.api.schemas import (
     BookCreate,
     BookEdition,
     BookPage,
+    BookFactRevision,
+    BookFactRevisionRequest,
+    AudioAsset,
     CancelRequest,
     CreativeProject,
     CreativeProjectCreate,
@@ -22,6 +25,8 @@ from book_video.api.schemas import (
     CreativeWorkspace,
     Evidence,
     EvidenceCreate,
+    GenerationResult,
+    ModelCostRecord,
     PromotionCandidate,
     PromotionCandidateCreate,
     PromotionEligibilityUpdate,
@@ -125,6 +130,16 @@ def create_api_router(
     def get_book(book_id: UUID) -> dict:
         return domain.get_book(book_id)
 
+    @router.patch("/books/{book_id}/facts/{fact_key}", operation_id="reviseBookFact",
+                  response_model=BookFactRevision)
+    def revise_book_fact(book_id: UUID, fact_key: str, data: BookFactRevisionRequest) -> dict:
+        return domain.revise_book_fact(book_id, fact_key, data)
+
+    @router.get("/books/{book_id}/facts/{fact_key}/revisions",
+                operation_id="listBookFactRevisions", response_model=list[BookFactRevision])
+    def list_book_fact_revisions(book_id: UUID, fact_key: str) -> list[dict]:
+        return domain.list_book_fact_revisions(book_id, fact_key)
+
     @router.post(
         "/promotion-candidates",
         operation_id="createPromotionCandidate",
@@ -141,6 +156,29 @@ def create_api_router(
     )
     def get_promotion_candidate(candidate_id: UUID) -> dict:
         return domain.get_promotion_candidate(candidate_id)
+
+    @router.post("/audio-assets", operation_id="uploadAudioAsset", response_model=AudioAsset,
+                 status_code=201)
+    async def upload_audio_asset(
+        file: UploadFile = File(), sha256: str = Form(), origin: str = Form(),
+        rights_attested: bool = Form(), rights_proof_note: str = Form(),
+        permitted_uses: str = Form(), expires_at: str | None = Form(default=None),
+    ) -> dict:
+        content = await file.read(10 * 1024 * 1024 + 1)
+        return domain.upload_audio_asset(
+            content, sha256=sha256, origin=origin, rights_attested=rights_attested,
+            rights_proof_note=rights_proof_note, permitted_uses=permitted_uses,
+            expires_at=expires_at, declared_mime_type=file.content_type,
+        )
+
+    @router.get("/audio-assets", operation_id="listAudioAssets", response_model=list[AudioAsset])
+    def list_audio_assets() -> list[dict]:
+        return domain.list_audio_assets()
+
+    @router.get("/audio-assets/{audio_asset_id}", operation_id="getAudioAsset",
+                response_model=AudioAsset)
+    def get_audio_asset(audio_asset_id: UUID) -> dict:
+        return domain.get_audio_asset(audio_asset_id)
 
     @router.patch(
         "/promotion-candidates/{candidate_id}/eligibility",
@@ -258,6 +296,16 @@ def create_api_router(
     )
     def get_run(run_id: UUID) -> dict:
         return domain.get_run(run_id)
+
+    @router.get("/runs/{run_id}/generation-results", operation_id="listGenerationResults",
+                response_model=list[GenerationResult])
+    def list_generation_results(run_id: UUID) -> list[dict]:
+        return domain.list_generation_results(run_id)
+
+    @router.get("/runs/{run_id}/costs", operation_id="listRunCosts",
+                response_model=list[ModelCostRecord])
+    def list_run_costs(run_id: UUID) -> list[dict]:
+        return domain.list_run_costs(run_id)
 
     @router.get(
         "/runs/{run_id}/events",

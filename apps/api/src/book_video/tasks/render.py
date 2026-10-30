@@ -314,6 +314,51 @@ def _validate_snapshot(snapshot: Mapping[str, Any]) -> tuple[dict[str, Any], int
     used_keys = {str(key) for segment in segments for key in segment.get("fact_keys", [])}
     if not used_keys or not used_keys.issubset(verified_keys):
         raise RenderSnapshotError("script references a fact that is not verified")
+    refs = script.get("fact_revision_refs")
+    if refs is not None:
+        current = {
+            str(fact.get("key")): fact
+            for fact in book.get("facts", []) if isinstance(fact, Mapping)
+        }
+        for ref in refs:
+            if not isinstance(ref, Mapping) or str(ref.get("key")) not in current:
+                raise RenderSnapshotError("script fact revision is unavailable")
+            fact = current[str(ref["key"])]
+            if fact.get("verification_status") not in {"source_verified", "human_confirmed"}:
+                raise RenderSnapshotError("script fact revision has been withdrawn")
+            if not str(fact.get("source_note") or "").strip() and not fact.get("evidence_id"):
+                raise RenderSnapshotError("script fact revision has no basis")
+            if int(ref.get("revision") or 0) != int(fact.get("revision") or 1):
+                raise RenderSnapshotError("script fact revision is stale")
+
+    if "audio_media_path" in snapshot or "audio_path" in snapshot:
+        raise RenderSnapshotError("client media paths are not accepted")
+    audio_id = snapshot.get("audio_asset_id")
+    audio = snapshot.get("audio_asset")
+    if audio_id is None:
+        if audio is not None:
+            raise RenderSnapshotError("audio metadata requires audio_asset_id")
+    else:
+        if not isinstance(audio_id, str) or not audio_id or not isinstance(audio, Mapping):
+            raise RenderSnapshotError("audio asset must be resolved by the server")
+        if str(audio.get("id")) != audio_id or str(audio.get("owner_user_id")) != str(project.get("owner_user_id")):
+            raise RenderSnapshotError("audio asset owner or ID mismatch")
+        if audio.get("origin") not in {"self_recorded_voice", "licensed_voice"}:
+            raise RenderSnapshotError("audio asset origin is not permitted")
+        if audio.get("usage_status") != "allowed" or audio.get("rights_attested") is not True:
+            raise RenderSnapshotError("audio asset rights are blocked")
+        if not str(audio.get("rights_proof_note") or "").strip() or audio.get("permitted_uses") != "render_and_manual_publish":
+            raise RenderSnapshotError("audio asset permission proof is incomplete")
+        expires_at = audio.get("expires_at")
+        if audio.get("origin") == "licensed_voice" and not expires_at:
+            raise RenderSnapshotError("licensed audio requires an expiry")
+        if expires_at:
+            try:
+                expires = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+                if expires.tzinfo is None or expires.astimezone(timezone.utc) <= datetime.now(timezone.utc):
+                    raise ValueError("expired")
+            except ValueError as error:
+                raise RenderSnapshotError("audio asset permission is expired or invalid") from error
 
     rights = snapshot.get("asset_rights", [])
     if not isinstance(rights, list):
@@ -336,6 +381,7 @@ def run_render_task(
     attempt: int | None = None,
     idempotency_store: IdempotencyStore | None = None,
     renderer: Callable[..., dict[str, Any]] = render_mp4,
+    audio_resolver: Callable[[str], Path] | None = None,
     cancel_check: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Render an approved snapshot once and return RenderJob-shaped metadata.
@@ -365,6 +411,8 @@ def run_render_task(
             "asset_rights",
             "width",
             "height",
+            "audio_asset_id",
+            "audio_asset",
         )
     }
     request_fingerprint = _fingerprint(immutable_input)
@@ -379,6 +427,13 @@ def run_render_task(
 
     def operation() -> dict[str, Any]:
         check_cancelled()
+        audio_path = None
+        if normalized.get("audio_asset_id") is not None:
+            if audio_resolver is None:
+                raise RenderSnapshotError("approved audio requires a server media resolver")
+            audio_path = audio_resolver(str(normalized["audio_asset_id"]))
+            if not isinstance(audio_path, Path) or not audio_path.is_file():
+                raise RenderSnapshotError("approved audio file is unavailable")
         # A retry retains the render ID and output path. Remove any incomplete
         # file left by a failed prior attempt before starting the next one.
         output_path.unlink(missing_ok=True)
@@ -386,10 +441,15 @@ def run_render_task(
             "id": render_id,
             "project_id": str(normalized["project"]["id"]),
             "script_version_id": str(normalized["script_version"]["id"]),
+            "audio_asset_id": normalized.get("audio_asset_id"),
             "owner_user_id": str(normalized["project"]["owner_user_id"]),
             "created_at": _timestamp(),
         }
         try:
+            renderer_options = {
+                "audio_path": audio_path,
+                "audio_origin": normalized["audio_asset"]["origin"],
+            } if audio_path is not None else {}
             metadata = renderer(
                 normalized["script_version"]["segments"],
                 duration_seconds=duration,
@@ -397,6 +457,7 @@ def run_render_task(
                 width=normalized.get("width", WIDTH),
                 height=normalized.get("height", HEIGHT),
                 cancel_check=cancel_check,
+                **renderer_options,
             )
         except MediaCancelledError:
             output_path.unlink(missing_ok=True)

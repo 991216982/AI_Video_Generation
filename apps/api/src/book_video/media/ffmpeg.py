@@ -1,4 +1,4 @@
-"""FFmpeg renderer for silent, text-first 9:16 video and ffprobe checks."""
+"""FFmpeg renderer for text-first 9:16 video with optional approved voice."""
 
 from __future__ import annotations
 
@@ -197,13 +197,11 @@ def render_mp4(
     ffmpeg_path: str | None = None,
     ffprobe_path: str | None = None,
     font_path: str | Path | None = None,
+    audio_path: Path | None = None,
+    audio_origin: str | None = None,
     cancel_check: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
-    """Render only supplied script text plus generated geometric shapes.
-
-    The output is always silent. No image, music, voice, TTS, network URL, or
-    book-cover path is accepted by this function.
-    """
+    """Render original text/shapes and optionally a server-resolved voice file."""
 
     _check_cancelled(cancel_check)
     if width != WIDTH or height != HEIGHT:
@@ -219,6 +217,13 @@ def render_mp4(
         raise MediaRenderError("segment durations must be positive and sum to duration_seconds")
     if any(not str(segment.get("onscreen_text", "")).strip() for segment in segments):
         raise MediaRenderError("each segment must include onscreen_text")
+    if audio_path is not None:
+        if not isinstance(audio_path, Path) or not audio_path.is_file() or audio_path.stat().st_size == 0:
+            raise MediaRenderError("approved audio file is missing or empty")
+        if audio_origin not in {"self_recorded_voice", "licensed_voice"}:
+            raise MediaRenderError("approved audio origin is required")
+    elif audio_origin is not None:
+        raise MediaRenderError("audio origin requires an approved audio file")
 
     ffmpeg_binary = ffmpeg_path or shutil.which("ffmpeg")
     if not ffmpeg_binary:
@@ -246,9 +251,11 @@ def render_mp4(
             "lavfi",
             "-i",
             f"color=c=0x0b1020:s={width}x{height}:r={FRAME_RATE}:d={duration_seconds}",
-            "-vf",
-            filter_graph,
-            "-an",
+        ]
+        if audio_path is not None:
+            command.extend(["-i", str(audio_path), "-map", "0:v:0", "-map", "1:a:0", "-af", "apad"])
+        command.extend([
+            "-vf", filter_graph,
             "-c:v",
             "libx264",
             "-preset",
@@ -257,12 +264,18 @@ def render_mp4(
             "22",
             "-pix_fmt",
             "yuv420p",
+        ])
+        if audio_path is None:
+            command.append("-an")
+        else:
+            command.extend(["-c:a", "aac", "-b:a", "128k"])
+        command.extend([
             "-movflags",
             "+faststart",
             "-t",
             str(duration_seconds),
             str(temporary_output),
-        ]
+        ])
         completed = _run_ffmpeg(command, cancel_check)
         if completed.returncode != 0:
             raise MediaRenderError(f"ffmpeg failed: {completed.stderr.strip() or completed.returncode}")
@@ -290,8 +303,8 @@ def render_mp4(
     except MediaCancelledError:
         destination.unlink(missing_ok=True)
         raise
-    if metadata["audio_present"]:
-        raise MediaRenderError("output unexpectedly contains audio; silent rendering is required")
-    metadata["asset_origins"] = ["self_created_text", "self_created_graphic"]
-    metadata["render_mode"] = "local_text_and_shapes_silent"
+    if metadata["audio_present"] != (audio_path is not None):
+        raise MediaRenderError("rendered audio stream does not match approved voice selection")
+    metadata["asset_origins"] = ["self_created_text", "self_created_graphic"] + ([audio_origin] if audio_origin is not None else [])
+    metadata["render_mode"] = "local_text_and_shapes_with_voice" if audio_path is not None else "local_text_and_shapes_silent"
     return metadata

@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import io
 import shutil
+import wave
 from pathlib import Path
 
 import pytest
@@ -36,16 +39,22 @@ def test_manual_flow_to_downloadable_mp4(tmp_path: Path) -> None:
     assert book_response.status_code == 201, book_response.text
     book = book_response.json()
 
-    candidate_data = {
-        **sample["promotion_candidate"],
-        "book_id": book["id"],
-        "eligibility_status": "manually_confirmed",
-        "eligibility_checked_at": "2026-10-28T00:00:00Z",
-        "eligibility_note": "仅供虚构样例测试，非真实商品资格",
-    }
+    candidate_data = {**sample["promotion_candidate"], "book_id": book["id"]}
     candidate_response = client.post("/api/v1/promotion-candidates", json=candidate_data)
     assert candidate_response.status_code == 201, candidate_response.text
     candidate = candidate_response.json()
+    assert candidate["eligibility_status"] == "unverified"
+    confirmation_response = client.patch(
+        f"/api/v1/promotion-candidates/{candidate['id']}/eligibility",
+        json={
+            "eligibility_status": "manually_confirmed",
+            "expected_revision": candidate["eligibility_revision"],
+            "eligibility_note": "虚构演示：账号持有人在测试情境中人工核对",
+            "confirmation_basis": "creator_account_backend",
+        },
+    )
+    assert confirmation_response.status_code == 200, confirmation_response.text
+    candidate = confirmation_response.json()
 
     evidence_response = client.post("/api/v1/evidence", json=sample["evidence"])
     assert evidence_response.status_code == 201, evidence_response.text
@@ -68,11 +77,26 @@ def test_manual_flow_to_downloadable_mp4(tmp_path: Path) -> None:
     )
     assert run_response.status_code == 202, run_response.text
     run = run_response.json()
+    replay = client.post(
+        f"/api/v1/creative-projects/{project['id']}/runs",
+        headers={"Idempotency-Key": "demo-script-run-1"},
+        json={"brief_version": 1},
+    )
+    assert replay.status_code == 202 and replay.json()["id"] == run["id"]
     assert process_one(service)
     waiting = client.get(f"/api/v1/runs/{run['id']}").json()
     assert waiting["status"] == "waiting_review", waiting
     versions = client.get(f"/api/v1/creative-projects/{project['id']}/scripts").json()
     assert len(versions) == 2
+    results_response = client.get(f"/api/v1/runs/{run['id']}/generation-results")
+    costs_response = client.get(f"/api/v1/runs/{run['id']}/costs")
+    assert results_response.status_code == 200, results_response.text
+    assert costs_response.status_code == 200, costs_response.text
+    results, costs = results_response.json(), costs_response.json()
+    assert len(results) == len(costs) == 2
+    assert {item["script_version_id"] for item in results} == {item["id"] for item in versions}
+    assert {item["generation_result_id"] for item in costs} == {item["id"] for item in results}
+    assert all(item["amount_minor"] == 0 for item in costs)
 
     edited_segments = [dict(segment) for segment in versions[0]["segments"]]
     edited_segments[0]["onscreen_text"] = "你会怎样画出今天的路线？（创作者改稿）"
@@ -146,3 +170,50 @@ def test_manual_flow_to_downloadable_mp4(tmp_path: Path) -> None:
     assert video_response.status_code == 200, video_response.text
     assert video_response.headers["content-type"].startswith("video/mp4")
     assert len(video_response.content) > 1000
+
+    # A synthetic WAV exercises the consented self-recording path without
+    # placing a real person's voice or copyrighted audio in the repository.
+    audio_buffer = io.BytesIO()
+    with wave.open(audio_buffer, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(16_000)
+        wav.writeframes(b"\0" * (16_000 * 2 * 30))
+    audio_bytes = audio_buffer.getvalue()
+    upload = client.post(
+        "/api/v1/audio-assets",
+        data={
+            "sha256": hashlib.sha256(audio_bytes).hexdigest(),
+            "origin": "self_recorded_voice",
+            "rights_attested": "true",
+            "rights_proof_note": "虚构演示：合成音频模拟本人录音流程，不是真实声音",
+            "permitted_uses": "render_and_manual_publish",
+        },
+        files={"file": ("fictional.wav", audio_bytes, "audio/wav")},
+    )
+    assert upload.status_code == 201, upload.text
+    audio_asset = upload.json()
+    assert audio_asset["usage_status"] == "allowed"
+    audio_render_response = client.post(
+        "/api/v1/renders",
+        headers={"Idempotency-Key": "demo-audio-render-0002"},
+        json={
+            "project_id": project["id"],
+            "script_version_id": edited["id"],
+            "promotion_candidate_id": candidate["id"],
+            "width": 1080,
+            "height": 1920,
+            "audio_asset_id": audio_asset["id"],
+            "asset_rights": SELF_CREATED_RIGHTS,
+        },
+    )
+    assert audio_render_response.status_code == 202, audio_render_response.text
+    audio_render = audio_render_response.json()
+    assert process_one(service)
+    audio_finished = client.get(f"/api/v1/renders/{audio_render['id']}").json()
+    assert audio_finished["status"] == "succeeded", audio_finished
+    audio_probe = probe_mp4(service.get_render_download_path(audio_render["id"]))
+    assert audio_probe["width"] == 1080 and audio_probe["height"] == 1920
+    assert 20 <= audio_probe["duration_seconds"] <= 45
+    assert audio_probe["audio_present"]
+    assert client.get(f"/api/v1/renders/{audio_render['id']}/download").status_code == 200
