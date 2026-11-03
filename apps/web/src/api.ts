@@ -100,6 +100,264 @@ export interface Evidence extends EvidenceCreate {
   collected_at: string;
 }
 
+export interface EvidencePage {
+  items: Evidence[];
+  next_cursor: string | null;
+}
+
+// --- W4 research desk: metric evidence, content references, style cards, CSV import ---
+
+export type MetricBasis =
+  | "authorized_order_sales"
+  | "platform_listing_display"
+  | "third_party_or_manual_estimate"
+  | "engagement_signal"
+  | "legacy_unclassified";
+
+export type MetricName =
+  | "sales_units"
+  | "sales_amount"
+  | "listed_price"
+  | "displayed_sales_label"
+  | "plays"
+  | "likes"
+  | "comments"
+  | "shares"
+  | "favorites"
+  | "follower_count"
+  | "ranking_position"
+  | "search_heat"
+  | "other";
+
+export type MetricUnit =
+  | "count"
+  | "minor_currency"
+  | "currency_yuan"
+  | "views"
+  | "likes"
+  | "percent"
+  | "rank"
+  | "score"
+  | "text"
+  | "unspecified";
+
+export type ObjectType = "product_listing" | "creator_account" | "content_item" | "book_edition";
+
+export interface MetricObservationCreate {
+  platform: Platform | null;
+  book_id: string | null;
+  object_type: ObjectType;
+  object_ref: string;
+  object_label: string | null;
+  metric_name: MetricName;
+  metric_definition: string;
+  basis: MetricBasis;
+  unit: MetricUnit;
+  value: number | null;
+  value_text: string | null;
+  window_start: string | null;
+  window_end: string | null;
+  observed_at: string;
+  evidence_id: string | null;
+  missing_reason: string | null;
+  confidence: "high" | "medium" | "low" | null;
+  expires_at: string | null;
+  note: string | null;
+}
+
+export interface MetricObservation extends MetricObservationCreate {
+  id: string;
+  owner_user_id: string;
+  collected_at: string;
+  legacy_backfill: boolean;
+}
+
+export interface MetricObservationPage {
+  items: MetricObservation[];
+  next_cursor: string | null;
+}
+
+export type LicenseScope = "own_account" | "licensed_data_service" | "manual_observation";
+export type CapturedField = "title" | "author" | "platform_ref" | "url" | "observed_note" | "publication_date" | "platform_label";
+
+export interface ContentReferenceCreate {
+  platform: Platform | null;
+  book_id: string | null;
+  ref_type: ObjectType;
+  external_ref: string | null;
+  reference_url: string | null;
+  title: string;
+  note: string | null;
+  license_scope: LicenseScope;
+  usage_basis: string;
+  captured_fields: CapturedField[];
+  evidence_ids: string[];
+  observed_at: string | null;
+  material_statement: "no_third_party_media_or_verbatim_transcript";
+}
+
+export interface ContentReference extends ContentReferenceCreate {
+  id: string;
+  owner_user_id: string;
+  created_at: string;
+}
+
+export interface ContentReferencePage {
+  items: ContentReference[];
+  next_cursor: string | null;
+}
+
+export type StyleCardStatus = "draft" | "pending_review" | "approved" | "rejected";
+export type StyleFeatureKey =
+  | "opening_hook"
+  | "narrative_structure"
+  | "pacing"
+  | "visual_style"
+  | "subtitle_style"
+  | "tone"
+  | "cta"
+  | "audience_match"
+  | "other";
+
+export interface StyleFeature {
+  feature_key: StyleFeatureKey;
+  label: string;
+  explanation: string;
+  evidence_ids: string[];
+  sample_count: number;
+}
+
+export interface StyleCardCreate {
+  title: string;
+  target_platform: Platform | null;
+  book_id: string | null;
+  derived_by: "manual" | "workflow_extraction";
+  features: StyleFeature[];
+  evidence_ids: string[];
+  reference_ids: string[];
+  human_note: string | null;
+}
+
+export interface StyleCardUpdate {
+  expected_revision: number;
+  title?: string;
+  target_platform?: Platform | null;
+  features?: StyleFeature[];
+  evidence_ids?: string[];
+  reference_ids?: string[];
+  human_note?: string | null;
+}
+
+export interface StyleCardReview {
+  decision: "approve" | "reject";
+  note: string | null;
+}
+
+export interface StyleCard extends StyleCardCreate {
+  id: string;
+  owner_user_id: string;
+  created_at: string;
+  updated_at: string;
+  revision: number;
+  review_status: StyleCardStatus;
+  edited_by_user_id: string | null;
+  last_edited_at: string | null;
+  abstract_only: boolean;
+  evidence_sample_count: number;
+}
+
+export interface StyleCardPage {
+  items: StyleCard[];
+  next_cursor: string | null;
+}
+
+export type ImportStatus = "preview" | "applied" | "partially_applied" | "failed";
+
+export type ImportRowCode =
+  | "encoding_error"
+  | "malformed_row"
+  | "missing_required_field"
+  | "invalid_book_isbn"
+  | "invalid_number"
+  | "invalid_timestamp"
+  | "invalid_platform"
+  | "invalid_url"
+  | "formula_injection"
+  | "duplicate_natural_key"
+  | "edition_mismatch_suspected"
+  | "unknown_column"
+  | "field_too_long"
+  | "invalid_mapping"
+  | "reference_rights_unsupported";
+
+export interface ImportRowDiagnostic {
+  row_number: number;
+  field: string | null;
+  code: ImportRowCode;
+  message: string;
+  severity: "error" | "warning";
+}
+
+export interface ImportPreview {
+  id: string;
+  owner_user_id: string;
+  status: ImportStatus;
+  filename: string;
+  encoding_detected: "utf8" | "utf8_bom" | "unknown";
+  file_sha256: string;
+  size_bytes: number;
+  columns: string[];
+  total_rows: number;
+  parsed_rows: number;
+  valid_rows: number;
+  failed_rows: number;
+  skipped_duplicate_rows: number;
+  mapping_suggestions: Record<string, string | null>;
+  row_diagnostics: ImportRowDiagnostic[];
+  created_at: string;
+  expires_at: string;
+}
+
+export interface ImportConfirm {
+  mapping: Record<string, string | null>;
+  on_duplicate: "skip" | "update";
+  match_by: "isbn" | "isbn_and_edition" | "title_author_fuzzy";
+  normalize_isbn: boolean;
+  note: string | null;
+}
+
+export interface ImportCounts {
+  total: number;
+  parsed: number;
+  persisted: number;
+  skipped_duplicate: number;
+  failed: number;
+  warnings: number;
+}
+
+export type ImportEntityKind = "book_edition" | "promotion_candidate" | "metric_observation" | "evidence" | "content_reference";
+
+export interface ImportJob {
+  id: string;
+  owner_user_id: string;
+  status: ImportStatus;
+  filename: string;
+  file_sha256: string;
+  created_at: string;
+  updated_at: string;
+  counts: ImportCounts;
+  row_diagnostics: ImportRowDiagnostic[];
+  entity_kinds: ImportEntityKind[];
+  mapping: Record<string, string | null>;
+  on_duplicate: "skip" | "update";
+  match_by: "isbn" | "isbn_and_edition" | "title_author_fuzzy";
+}
+
+export interface ImportPage {
+  items: ImportJob[];
+  next_cursor: string | null;
+}
+
 export interface CreativeProjectCreate {
   book_id: string;
   promotion_candidate_id: string;
@@ -424,6 +682,105 @@ export class BookVideoApi {
 
   createEvidence(input: EvidenceCreate): Promise<Evidence> {
     return this.request("/evidence", { method: "POST", body: JSON.stringify(input) });
+  }
+
+  listEvidence(options: PageOptions & { source_type?: "manual" | "licensed"; q?: string } = {}): Promise<EvidencePage> {
+    const query = new URLSearchParams({ limit: String(options.limit ?? 20) });
+    if (options.cursor) query.set("cursor", options.cursor);
+    if (options.source_type) query.set("source_type", options.source_type);
+    if (options.q?.trim()) query.set("q", options.q.trim());
+    return this.request(`/evidence?${query.toString()}`);
+  }
+
+  listMetrics(options: PageOptions & { platform?: Platform; object_type?: ObjectType; metric_name?: MetricName; basis?: MetricBasis; book_id?: string } = {}): Promise<MetricObservationPage> {
+    const query = new URLSearchParams({ limit: String(options.limit ?? 20) });
+    if (options.cursor) query.set("cursor", options.cursor);
+    if (options.platform) query.set("platform", options.platform);
+    if (options.object_type) query.set("object_type", options.object_type);
+    if (options.metric_name) query.set("metric_name", options.metric_name);
+    if (options.basis) query.set("basis", options.basis);
+    if (options.book_id) query.set("book_id", options.book_id);
+    return this.request(`/metrics?${query.toString()}`);
+  }
+
+  createMetric(input: MetricObservationCreate): Promise<MetricObservation> {
+    return this.request("/metrics", { method: "POST", body: JSON.stringify(input) });
+  }
+
+  getMetric(observationId: string): Promise<MetricObservation> {
+    return this.request(`/metrics/${encodeURIComponent(observationId)}`);
+  }
+
+  listContentReferences(options: PageOptions & { platform?: Platform; ref_type?: ObjectType; book_id?: string } = {}): Promise<ContentReferencePage> {
+    const query = new URLSearchParams({ limit: String(options.limit ?? 20) });
+    if (options.cursor) query.set("cursor", options.cursor);
+    if (options.platform) query.set("platform", options.platform);
+    if (options.ref_type) query.set("ref_type", options.ref_type);
+    if (options.book_id) query.set("book_id", options.book_id);
+    return this.request(`/content-references?${query.toString()}`);
+  }
+
+  createContentReference(input: ContentReferenceCreate): Promise<ContentReference> {
+    return this.request("/content-references", { method: "POST", body: JSON.stringify(input) });
+  }
+
+  getContentReference(referenceId: string): Promise<ContentReference> {
+    return this.request(`/content-references/${encodeURIComponent(referenceId)}`);
+  }
+
+  listStyleCards(options: PageOptions & { review_status?: StyleCardStatus; target_platform?: Platform; book_id?: string } = {}): Promise<StyleCardPage> {
+    const query = new URLSearchParams({ limit: String(options.limit ?? 20) });
+    if (options.cursor) query.set("cursor", options.cursor);
+    if (options.review_status) query.set("review_status", options.review_status);
+    if (options.target_platform) query.set("target_platform", options.target_platform);
+    if (options.book_id) query.set("book_id", options.book_id);
+    return this.request(`/style-cards?${query.toString()}`);
+  }
+
+  createStyleCard(input: StyleCardCreate): Promise<StyleCard> {
+    return this.request("/style-cards", { method: "POST", body: JSON.stringify(input) });
+  }
+
+  getStyleCard(styleCardId: string): Promise<StyleCard> {
+    return this.request(`/style-cards/${encodeURIComponent(styleCardId)}`);
+  }
+
+  updateStyleCard(styleCardId: string, input: StyleCardUpdate): Promise<StyleCard> {
+    return this.request(`/style-cards/${encodeURIComponent(styleCardId)}`, { method: "PATCH", body: JSON.stringify(input) });
+  }
+
+  reviewStyleCard(styleCardId: string, input: StyleCardReview): Promise<StyleCard> {
+    return this.request(`/style-cards/${encodeURIComponent(styleCardId)}/review`, { method: "POST", body: JSON.stringify(input) });
+  }
+
+  listImports(options: PageOptions & { status?: ImportStatus } = {}): Promise<ImportPage> {
+    const query = new URLSearchParams({ limit: String(options.limit ?? 20) });
+    if (options.cursor) query.set("cursor", options.cursor);
+    if (options.status) query.set("status", options.status);
+    return this.request(`/imports?${query.toString()}`);
+  }
+
+  previewImport(file: File, filenameHint?: string): Promise<ImportPreview> {
+    const body = new FormData();
+    body.set("file", file);
+    if (filenameHint) body.set("filename_hint", filenameHint);
+    return this.request("/imports/preview", {
+      method: "POST",
+      headers: { "Idempotency-Key": idempotencyKey() },
+      body,
+    });
+  }
+
+  getImport(importId: string): Promise<ImportJob> {
+    return this.request(`/imports/${encodeURIComponent(importId)}`);
+  }
+
+  confirmImport(importId: string, input: ImportConfirm): Promise<ImportJob> {
+    return this.request(`/imports/${encodeURIComponent(importId)}/confirm`, {
+      method: "POST",
+      headers: { "Idempotency-Key": idempotencyKey() },
+      body: JSON.stringify(input),
+    });
   }
 
   createProject(input: CreativeProjectCreate): Promise<CreativeProject> {

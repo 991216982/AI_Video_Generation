@@ -524,6 +524,7 @@ def test_sqlite_migration_survives_database_reopen(tmp_path) -> None:
         "003_render_execution_lease",
         "004_w3_generation_audio",
         "005_w3_invocation_recovery",
+        "006_w4_research",
     ]
 
 
@@ -1259,6 +1260,6 @@ def test_003_upgrades_database_where_original_002_is_already_applied(tmp_path) -
         ]
     assert "execution_claimed_at" in columns_after
     assert "idx_render_jobs_execution_lease" in indexes
-    assert versions == ["001_initial", "002_w2_reliability", "003_render_execution_lease", "004_w3_generation_audio", "005_w3_invocation_recovery"]
+    assert versions == ["001_initial", "002_w2_reliability", "003_render_execution_lease", "004_w3_generation_audio", "005_w3_invocation_recovery", "006_w4_research"]
     service = DomainService(database, owner_user_id=OWNER_ID)
     assert service.claim_next_resumable_render() is None

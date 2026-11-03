@@ -16,7 +16,7 @@ CONTRACTS = ROOT / "packages" / "contracts"
 def main() -> None:
     spec = yaml.safe_load((CONTRACTS / "openapi.yaml").read_text(encoding="utf-8"))
     assert spec["openapi"] == "3.1.0"
-    assert spec["info"]["version"] == "0.3.0"
+    assert spec["info"]["version"] == "0.4.0"
     assert len(spec["paths"]) >= 10
     operation_ids = [
         operation["operationId"]
@@ -122,6 +122,110 @@ def main() -> None:
     assert not Draft202012Validator(schemas["RenderCreate"], resolver=resolver, format_checker=FormatChecker()).is_valid(
         {**g3["render_request"], "audio_asset_id": "C:\\secret\\voice.wav"}
     )
+
+    # --- G4 v0.4 contract increment: research desk, metric evidence, references, style cards, CSV import ---
+    g4 = json.loads((CONTRACTS / "examples" / "g4-research.json").read_text(encoding="utf-8"))
+    assert g4["sample_only"] is True
+    for sample_key, schema_name in (
+        ("evidence_manual", "EvidenceCreate"),
+        ("evidence_order", "EvidenceCreate"),
+        ("evidence_page", "EvidenceCreate"),
+        ("metric_order_sales", "MetricObservation"),
+        ("metric_platform_display", "MetricObservation"),
+        ("metric_estimate", "MetricObservation"),
+        ("metric_engagement", "MetricObservation"),
+        ("metric_missing", "MetricObservation"),
+        ("content_reference_own", "ContentReference"),
+        ("content_reference_manual", "ContentReference"),
+        ("style_card", "StyleCard"),
+        ("style_card_draft_unevidenced", "StyleCard"),
+        ("import_preview", "ImportPreview"),
+        ("import_confirm", "ImportConfirm"),
+        ("import_job", "ImportJob"),
+    ):
+        Draft202012Validator(schemas[schema_name], resolver=resolver).validate(g4[sample_key])
+
+    metric_schema = schemas["MetricObservationCreate"]
+    metric_validator = Draft202012Validator(metric_schema, resolver=resolver)
+    metric_response_only = {"id", "owner_user_id", "collected_at", "legacy_backfill"}
+
+    def metric_create(observation: dict) -> dict:
+        return {k: v for k, v in observation.items() if k not in metric_response_only}
+
+    # A numeric observation without source evidence must be rejected.
+    with_evidence = metric_create(g4["metric_order_sales"])
+    missing_evidence = {**with_evidence, "evidence_id": None}
+    assert not metric_validator.is_valid(missing_evidence)
+    # A null value without a missing reason must be rejected; 0 is never used to mean unknown.
+    null_no_reason = {**metric_create(g4["metric_missing"]), "value": None, "missing_reason": None}
+    assert not metric_validator.is_valid(null_no_reason)
+    null_with_reason = metric_create(g4["metric_missing"])
+    assert metric_validator.is_valid(null_with_reason)
+    # A present window start requires a matching window end at schema level;
+    # ordering (start <= end) and timezone parsing are enforced by the domain/API layer, like v0.3 Evidence.
+    partial_window = {**with_evidence, "window_start": "2026-10-25T00:00:00Z", "window_end": None}
+    assert not metric_validator.is_valid(partial_window)
+    # Only authorized_order_sales may be presented as actual sales; estimates and engagement are separate bases.
+    assert g4["metric_estimate"]["basis"] == "third_party_or_manual_estimate"
+    assert g4["metric_engagement"]["basis"] == "engagement_signal"
+    assert g4["metric_platform_display"]["basis"] == "platform_listing_display"
+
+    ref_schema = schemas["ContentReferenceCreate"]
+    ref_validator = Draft202012Validator(ref_schema, resolver=resolver)
+    ref_response_only = {"id", "owner_user_id", "created_at"}
+
+    def ref_create(reference: dict) -> dict:
+        return {k: v for k, v in reference.items() if k not in ref_response_only}
+
+    # The material declaration is mandatory: no third-party media or verbatim transcript is stored.
+    assert not ref_validator.is_valid({**ref_create(g4["content_reference_own"]), "material_statement": None})
+    # URL scheme (http/https only; no file paths or client media bytes) and right-scope checks are
+    # enforced by the domain/API layer, matching the existing Evidence.source_url and
+    # RenderCreate.audio_asset_id rules; the schema itself only declares the uri format.
+
+    card_schema = schemas["StyleCardCreate"]
+    card_validator = Draft202012Validator(card_schema, resolver=resolver)
+    card_response_only = {
+        "id", "owner_user_id", "created_at", "updated_at", "revision", "review_status",
+        "edited_by_user_id", "last_edited_at", "abstract_only", "evidence_sample_count",
+    }
+
+    def card_create(card: dict) -> dict:
+        return {k: v for k, v in card.items() if k not in card_response_only}
+
+    # An evidence-backed card must list its evidence; every feature needs evidence and a sample count.
+    feature = g4["style_card"]["features"][0]
+    assert not card_validator.is_valid(
+        {**card_create(g4["style_card"]), "evidence_ids": [], "features": [{**feature, "evidence_ids": []}]}
+    )
+    assert not card_validator.is_valid(
+        {**card_create(g4["style_card"]), "features": [{**feature, "sample_count": 0}]}
+    )
+    # An evidence-free draft is allowed only as a provisional draft; it cannot be approved.
+    assert card_validator.is_valid(card_create(g4["style_card_draft_unevidenced"]))
+    assert g4["style_card_draft_unevidenced"]["evidence_sample_count"] == 0
+    assert g4["style_card_draft_unevidenced"]["review_status"] in {"draft", "pending_review"}
+
+    # CSV fixture: UTF-8 BOM, header aligned with the preview sample, six data rows.
+    csv_bytes = (CONTRACTS / "examples" / "research-import-fixture.csv").read_bytes()
+    assert csv_bytes.startswith(b"\xef\xbb\xbf"), "fixture must carry a UTF-8 BOM sample"
+    csv_text = csv_bytes.decode("utf-8-sig")
+    csv_lines = [line for line in csv_text.splitlines() if line.strip()]
+    header = csv_lines[0].split(",")
+    assert header == g4["import_preview"]["columns"]
+    assert len(csv_lines) - 1 == g4["import_preview"]["total_rows"]
+
+    # G4 decision: no new run-scoped SSE event this round. CSV import is synchronous request/response
+    # with row-level results in the body; research/style endpoints are human-driven writes outside the
+    # run lifecycle. The v0.3 event type set below must remain frozen unless W4 integration finds a
+    # real async progress need, at which point the contract change goes through the integration owner.
+    event_schema = json.loads((CONTRACTS / "events.schema.json").read_text(encoding="utf-8"))
+    expected_event_types = {
+        "run.created", "run.stage_changed", "run.review_requested", "run.reviewed", "run.failed",
+        "run.completed", "run.cancel_requested", "run.cancelled", "run.retry_requested",
+        "run.generation_completed", "run.generation_failed", "run.cost_recorded",
+    }
+    assert set(event_schema["properties"]["type"]["enum"]) == expected_event_types
     print("stage 0 contracts and examples: OK")
 
 

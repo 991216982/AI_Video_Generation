@@ -1,8 +1,8 @@
-# 共享契约 v0.3（G3 冻结稿）
+# 共享契约 v0.4（G4 冻结稿）
 
-`openapi.yaml` 是 W3 的 HTTP 源契约；`events.schema.json` 定义按 `GET /runs/{run_id}/events` 发送的 SSE `data` JSON。`examples/` 只含虚构输入和元数据，不含真实录音、商品或模型输出。契约字段使用 snake_case、UTC RFC 3339 时间戳、UUID 字符串；费用使用最小货币单位整数。当前运行代码为 v0.3；W3 已在虚构样例上完成本地集成验收，真实商品、本人录音许可与平台发布挂车仍待账号持有人手动验收。
+`openapi.yaml` 是 W4 的 HTTP 源契约；`events.schema.json` 定义按 `GET /runs/{run_id}/events` 发送的 SSE `data` JSON。`examples/` 只含虚构输入和元数据，不含真实录音、商品、抓取结果或模型输出。契约字段使用 snake_case、UTC RFC 3339 时间戳、UUID 字符串；费用使用最小货币单位整数。v0.4 端点已在本地单用户基线随 W4 集成落地并通过虚构样例测试；真实平台发布、账号资格与远端 CI 仍待账号持有人和集成负责人核实，本稿不宣称真实带货验收已通过。
 
-G3 起点：`main` 的 `c6f3e3eb215453ed9093145041d5f1d10a0b4151`。W2 复核所述 `8e17dc6` 到该提交只新增 G3 启动计划及文档索引。契约检查：`python scripts/verify_stage0.py`。
+本地集成基线：从 `e475a95` 建立 `codex/integrate-w4-crowdtest` 分支，将五份众测产物中的 W4 实现审查后接入。远端当前 SHA 与本分支 CI 尚未核实；本地检查见 [`docs/23-W4众测产物集成与修复记录.md`](../../docs/23-W4众测产物集成与修复记录.md)。契约检查：`python scripts/verify_stage0.py`。
 
 ## 必须遵守的语义
 
@@ -16,6 +16,69 @@ G3 起点：`main` 的 `c6f3e3eb215453ed9093145041d5f1d10a0b4151`。W2 复核所
 - `PublicationPackage` 的 `publication_state` 只表示本地准备情况；不表示视频已发布或商品已挂车。导出包始终包含人工检查项。
 - `video_download_url` 指向服务端按当前所有者校验的 `GET /renders/{render_id}/download`；仅返回本服务已完成的 MP4，不允许客户端指定文件路径。
 - 外部模型调用前持久化 `invocation_key` 占用；恢复时先读服务端结果、费用与私有结构化脚本。供应商无法按 key 查询结果且不保证请求幂等时，未确认的调用记录为 `manual_reconciliation_required`，费用未知保留原因，运行停止并等待人工核对，不自动重发。
+
+## G4 增量、迁移与兼容影响
+
+G4 为人工研究台冻结指标证据、内容参考、证据化风格卡和 CSV 导入契约；原 G4 契约阶段未实现 W4。当前集成分支已接入并修复 W4 实现，不启动 G5。所有新资源仍是当前 owner 私有；owner 由服务端从认证身份设定，客户端不得指定他人 ID，跨 owner 读写或引用一律按 404 `not_found`。
+
+### 1. 指标口径：四类证据分层，缺失保留原因
+
+`MetricObservation`（`/metrics`）把研究指标从旧 `Evidence.metric_*` 扁平字段拆成独立、可追溯的记录。`basis` 为四类口径，不可混排：
+
+| basis | 含义 | 可否称实际销量 |
+| --- | --- | --- |
+| `authorized_order_sales` | 获授权商家订单实际销量/销售额（授权店铺范围、统计期内） | **唯一**可表述为实际销量的口径 |
+| `platform_listing_display` | 平台页面展示值/展示档位文案（如“已售10万+”） | 否；展示值不等于订单，不等于抓取授权 |
+| `third_party_or_manual_estimate` | 获许可第三方服务估算或人工估算 | 否；界面必须标注“估算” |
+| `engagement_signal` | 播放、点赞、评论、分享、粉丝、排行、搜索热度等热度信号 | 否；只表示关注度/内容表现，不是销量 |
+| `legacy_unclassified` | v0.3 旧证据回填、口径未能分类的历史记录 | 否；重新核实前不参与排名，仅作待整理数据 |
+
+字段约束（schema 与领域层共同执行）：
+
+- 有数值的观察必须带同 owner 的 `evidence_id`、`metric_definition`（口径/范围/算法）和 `observed_at`；无来源、无定义或无时间窗的数值不得作为确定值展示。
+- `value=null` 表示数据缺失，**必须**有非空 `missing_reason`；`value=0` 只表示有依据的实测零，禁止用 0 冒充未知。非数值展示档位用 `value_text`，不参与数值排名。
+- `window_start/window_end` 同时存在或同时为空；领域层校验起始不晚于结束且时间戳带时区。
+- 可比性：排行与图表必须限定同一 `platform`、`object_type`/对象范围、`metric_name`、`unit`、`basis` 和时间窗；跨平台、跨口径或证据不足时显示“证据不足/未取得”，不强制生成绝对名次。`confidence`、`expires_at`、`note` 为可选辅助字段。
+- 旧 `Evidence.metric_*` 字段保留可读，新观察一律走 `/metrics`。
+
+### 2. 内容参考：只存有使用依据的研究材料
+
+`ContentReference`（`/content-references`）只保存研究所需的最小信息：类型（商品/账号/作品/图书版本）、平台原生稳定 ID 或人工稳定标签、链接、抽象观察笔记、授权范围与使用依据、关联证据和观察时间。
+
+- `license_scope` ∈ `own_account`（自有账号）、`licensed_data_service`（获许可数据服务）、`manual_observation`（人工观察）。链接不等于授权。
+- `material_statement` 固定为 `no_third_party_media_or_verbatim_transcript`：**不**存储第三方原视频、音轨、书封/商品图、完整字幕或逐字文案作为成片素材；`captured_fields` 仅声明允许留存的最小字段。未授权第三方媒体永远不能进入渲染素材链。
+- 引用的 `evidence_id` 必须同 owner；跨 owner 引用按 404。`reference_url` 仅限 http/https，不接受客户端本地路径或媒体字节（沿用 `Evidence.source_url` 与 `RenderCreate.audio_asset_id` 的校验口径）。
+
+### 3. 风格卡：只表达有证据支持的抽象特征，人工可修订审核
+
+`StyleCard`（`/style-cards`）输出抽象标签与解释（开场、结构、节奏、画面、字幕、语气、CTA 等），不复制第三方字幕、原句或素材。
+
+- `features[]` 每个特征关联 ≥1 条证据、`sample_count` ≥1；卡片整体 `evidence_ids` 与 `reference_ids` 可回溯。`abstract_only` 恒为 `true`。
+- 审核状态 `draft` / `pending_review` / `approved` / `rejected`。**无证据的卡片只能是草稿/待审**，不得标 `approved`；`approve` 时若证据为空或特征无证据，返回 422。已通过卡片不覆盖人工修订；修订走 `PATCH` 携带 `expected_revision`，冲突返回 409 `revision_conflict`，`revision` 递增。
+- `derived_by` ∈ `manual`、`workflow_extraction`；工作流提炼结果必须先关联证据并经人工审核才能作为创作输入。
+
+### 4. CSV 导入：安全、可纠错、可重复执行
+
+导入分三步：`POST /imports/preview`（解析不落库）→ 人工核对映射 → `POST /imports/{id}/confirm`（按映射写入，部分失败逐行记录）。预览草稿有过期时间，过期不能确认。
+
+- 文件：UTF-8（允许 BOM）；大小、行数服务端上限；公式前缀（`=`、`+`、`-`、`@` 等）单元格按纯文本转义并标记 `formula_injection`，绝不执行。`filename_hint` 仅作展示。
+- 行级诊断 `ImportRowDiagnostic` 带行号、字段、稳定错误码与级别（`error`/`warning`）；错误码见 `ImportRowDiagnostic.code`（`encoding_error`、`malformed_row`、`missing_required_field`、`invalid_book_isbn`、`invalid_number`、`invalid_timestamp`、`invalid_platform`、`invalid_url`、`formula_injection`、`duplicate_natural_key`、`edition_mismatch_suspected`、`unknown_column`、`field_too_long`、`invalid_mapping`、`reference_rights_unsupported`）。
+- 图书版次：自然键默认 `isbn_and_edition`（ISBN + 版次标签），可选 `isbn` 或 `title_author_fuzzy`；**同名异版不自动合并**，命中可疑差异给 `edition_mismatch_suspected` 警告。ISBN 可规范化（去连字符/空白），`normalize_isbn` 控制。
+- 重复与幂等：`on_duplicate` ∈ `skip`（默认）、`update`；同文件同映射重放结果可重复。写请求带 `Idempotency-Key`；同 key 同请求只产生一次导入结果，同 key 不同请求返回 409 `idempotency_key_conflict`。预览本身不落业务数据。
+- 部分失败：成功行提交，失败行进诊断，`status` ∈ `applied` / `partially_applied` / `failed`；`counts` 汇总 total/parsed/persisted/skipped_duplicate/failed/warnings。`entity_kinds` 记录本次涉及的实体类型。
+- 支持导入的实体：图书版次、拟挂商品、指标观察、证据、内容参考；风格卡不通过 CSV 批量生成。
+
+### 5. 分页、过滤、错误码与事件
+
+- 新列表（`/evidence`、`/metrics`、`/content-references`、`/style-cards`、`/imports`）沿用 v0.2 游标分页：仅当前 owner，`limit` 1–100 默认 20，`cursor` 绑定 owner 与过滤条件，换条件须丢弃旧游标；末页 `next_cursor=null`，空列表 `items=[]`。指标按 `(observed_at, id)` 倒序，其余按 `(created_at, id)` 倒序稳定排序。过滤参数见各端点定义；非法游标返回 422 `invalid_cursor`。
+- 错误正文沿用 `ApiError(code, message, request_id, details)`。本轮新增/复用码：`not_found`(404)、`validation_error`(422)、`revision_conflict`(409)、`idempotency_key_conflict`(409)、`invalid_cursor`(422)；导入作业级 422 码 `import_preview_expired`、`import_file_too_large`、`import_too_many_rows`、`import_mapping_invalid`，409 `import_already_applied`。
+- **事件判断：本轮不新增 SSE 事件。** CSV 导入是请求/响应内的同步流程（行数有上限，结果在行级诊断里返回），研究与风格卡写入是人工驱动、不属于 run 生命周期；W4-C 的证据化提炼在现有 run/确定性流程内消费服务端字段。若 W4 集成后确有后台长任务进度需求，再由集成负责人走契约变更增补事件，当前 `events.schema.json` 的 v0.3 事件集合保持冻结。
+
+### 6. 迁移默认值与 v0.3 兼容影响
+
+- 旧 `Evidence` 中带 `metric_name/metric_value/metric_window_*` 的记录：W4-A 迁移时回填一条 `MetricObservation`，`basis=legacy_unclassified`、`legacy_backfill=true`、`confidence=null`、`evidence_id` 指向原证据；数值缺失保留原 `missing_reason`。这些记录在重新核实前不参与排行。
+- 旧 `BookEdition`、`PromotionCandidate`、创作链记录字段与语义不变；历史数据不被默认视为授权数据或已核实资格。
+- v0.3 客户端：所有旧路径与请求字段保留；新端点为增量。新响应字段可被旧客户端忽略；旧 v0.3 服务端不提供新端点，前后端须同版本部署。严格枚举事件的消费者无需改动（无新事件类型）。旧 `Evidence.metric_*` 仍可读，但新研究数据应通过 `/metrics` 查询。
 
 ## G3 增量、迁移与兼容影响
 

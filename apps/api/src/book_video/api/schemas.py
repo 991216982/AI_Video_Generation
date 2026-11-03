@@ -388,6 +388,335 @@ class CreativeWorkspace(StrictModel):
     publication_package: PublicationPackage | None
 
 
+# --- W4-A: research desk, metric evidence, content references, style cards, CSV import ---
+
+class EvidencePage(StrictModel):
+    items: list[Evidence]
+    next_cursor: str | None
+
+
+MetricBasis = Literal[
+    "authorized_order_sales",
+    "platform_listing_display",
+    "third_party_or_manual_estimate",
+    "engagement_signal",
+    "legacy_unclassified",
+]
+MetricName = Literal[
+    "sales_units",
+    "sales_amount",
+    "listed_price",
+    "displayed_sales_label",
+    "plays",
+    "likes",
+    "comments",
+    "shares",
+    "favorites",
+    "follower_count",
+    "ranking_position",
+    "search_heat",
+    "other",
+]
+MetricUnit = Literal[
+    "count",
+    "minor_currency",
+    "currency_yuan",
+    "views",
+    "likes",
+    "percent",
+    "rank",
+    "score",
+    "text",
+    "unspecified",
+]
+ObjectType = Literal["product_listing", "creator_account", "content_item", "book_edition"]
+
+# Bases that describe a measured window; legacy_unclassified and platform display labels
+# may legitimately lack a bounded window until re-validated.
+_WINDOWED_BASES = {
+    "authorized_order_sales",
+    "third_party_or_manual_estimate",
+    "engagement_signal",
+}
+
+
+class MetricObservationCreate(StrictModel):
+    platform: Platform | None = None
+    book_id: UUID | None = None
+    object_type: ObjectType
+    object_ref: str = Field(min_length=1, max_length=200)
+    object_label: str | None = Field(default=None, max_length=200)
+    metric_name: MetricName
+    metric_definition: str = Field(min_length=1, max_length=500)
+    basis: MetricBasis
+    unit: MetricUnit
+    value: float | None = None
+    value_text: str | None = Field(default=None, max_length=100)
+    window_start: datetime | None = None
+    window_end: datetime | None = None
+    observed_at: datetime
+    evidence_id: UUID | None = None
+    missing_reason: str | None = Field(default=None, max_length=500)
+    confidence: Literal["high", "medium", "low"] | None = None
+    expires_at: datetime | None = None
+    note: str | None = Field(default=None, max_length=1000)
+
+    @field_validator("value")
+    @classmethod
+    def value_must_be_finite(cls, value: float | None) -> float | None:
+        if value is not None and not math.isfinite(value):
+            raise ValueError("metric value must be finite")
+        return value
+
+    @field_validator("observed_at", "window_start", "window_end", "expires_at")
+    @classmethod
+    def timestamps_must_include_timezone(cls, value: datetime | None) -> datetime | None:
+        return _timezone_aware(value)
+
+    @model_validator(mode="after")
+    def apply_metric_rules(self) -> "MetricObservationCreate":
+        if self.value is None and not (self.missing_reason or "").strip():
+            raise ValueError("missing_reason is required when the value is absent")
+        if self.value is not None and self.evidence_id is None:
+            raise ValueError("a numeric observation requires an evidence_id")
+        if self.value is not None and self.missing_reason is not None:
+            raise ValueError("a valued observation must not carry a missing reason")
+        if (self.window_start is None) != (self.window_end is None):
+            raise ValueError("window_start and window_end must both be present or both absent")
+        if (
+            self.window_start is not None
+            and self.window_end is not None
+            and self.window_start > self.window_end
+        ):
+            raise ValueError("window_start must not follow window_end")
+        if self.basis in _WINDOWED_BASES and (
+            self.window_start is None or self.window_end is None
+        ):
+            raise ValueError(f"{self.basis} observations require a metric time window")
+        return self
+
+
+class MetricObservation(MetricObservationCreate):
+    id: UUID
+    owner_user_id: UUID
+    collected_at: datetime
+    legacy_backfill: bool = False
+
+
+class MetricObservationPage(StrictModel):
+    items: list[MetricObservation]
+    next_cursor: str | None
+
+
+class ContentReferenceCreate(StrictModel):
+    platform: Platform | None = None
+    book_id: UUID | None = None
+    ref_type: ObjectType
+    external_ref: str | None = Field(default=None, max_length=200)
+    reference_url: str | None = None
+    title: str = Field(min_length=1, max_length=200)
+    note: str | None = Field(default=None, max_length=1000)
+    license_scope: Literal["own_account", "licensed_data_service", "manual_observation"]
+    usage_basis: str = Field(min_length=1, max_length=500)
+    captured_fields: list[
+        Literal["title", "author", "platform_ref", "url", "observed_note", "publication_date", "platform_label"]
+    ] = Field(default_factory=list)
+    evidence_ids: list[UUID] = Field(default_factory=list)
+    observed_at: datetime | None = None
+    material_statement: Literal["no_third_party_media_or_verbatim_transcript"]
+
+    @field_validator("reference_url")
+    @classmethod
+    def reference_url_must_be_a_web_uri(cls, value: str | None) -> str | None:
+        if value is not None:
+            _validate_web_uri(value, "reference_url")
+        return value
+
+    @field_validator("observed_at")
+    @classmethod
+    def observed_at_must_include_timezone(cls, value: datetime | None) -> datetime | None:
+        return _timezone_aware(value)
+
+
+class ContentReference(ContentReferenceCreate):
+    id: UUID
+    owner_user_id: UUID
+    created_at: datetime
+
+
+class ContentReferencePage(StrictModel):
+    items: list[ContentReference]
+    next_cursor: str | None
+
+
+StyleCardStatus = Literal["draft", "pending_review", "approved", "rejected"]
+
+
+class StyleFeature(StrictModel):
+    feature_key: Literal[
+        "opening_hook",
+        "narrative_structure",
+        "pacing",
+        "visual_style",
+        "subtitle_style",
+        "tone",
+        "cta",
+        "audience_match",
+        "other",
+    ]
+    label: str = Field(min_length=1, max_length=100)
+    explanation: str = Field(min_length=1, max_length=500)
+    evidence_ids: list[UUID] = Field(min_length=1)
+    sample_count: int = Field(ge=1)
+
+
+class StyleCardCreate(StrictModel):
+    title: str = Field(min_length=1, max_length=200)
+    target_platform: Platform | None = None
+    book_id: UUID | None = None
+    derived_by: Literal["manual", "workflow_extraction"] = "manual"
+    features: list[StyleFeature] = Field(default_factory=list)
+    evidence_ids: list[UUID] = Field(default_factory=list)
+    reference_ids: list[UUID] = Field(default_factory=list)
+    human_note: str | None = Field(default=None, max_length=1000)
+
+    @model_validator(mode="after")
+    def features_reference_evidence(self) -> "StyleCardCreate":
+        evidence = set(self.evidence_ids)
+        for feature in self.features:
+            if not set(feature.evidence_ids) <= evidence:
+                raise ValueError("each feature's evidence_ids must be part of the card evidence_ids")
+        return self
+
+
+class StyleCardUpdate(StrictModel):
+    expected_revision: int = Field(ge=1)
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    target_platform: Platform | None = None
+    features: list[StyleFeature] | None = None
+    evidence_ids: list[UUID] | None = None
+    reference_ids: list[UUID] | None = None
+    human_note: str | None = Field(default=None, max_length=1000)
+
+
+class StyleCardReview(StrictModel):
+    decision: Literal["approve", "reject"]
+    note: str | None = Field(default=None, max_length=1000)
+
+    @model_validator(mode="after")
+    def reject_requires_note(self) -> "StyleCardReview":
+        if self.decision == "reject" and not (self.note or "").strip():
+            raise ValueError("a rejected style card requires a note")
+        return self
+
+
+class StyleCard(StyleCardCreate):
+    id: UUID
+    owner_user_id: UUID
+    created_at: datetime
+    updated_at: datetime
+    revision: int = Field(ge=1)
+    review_status: StyleCardStatus
+    edited_by_user_id: UUID | None
+    last_edited_at: datetime | None
+    abstract_only: bool = True
+    evidence_sample_count: int = Field(ge=0)
+
+
+class StyleCardPage(StrictModel):
+    items: list[StyleCard]
+    next_cursor: str | None
+
+
+ImportStatus = Literal["preview", "applied", "partially_applied", "failed"]
+
+ImportRowCode = Literal[
+    "encoding_error",
+    "malformed_row",
+    "missing_required_field",
+    "invalid_book_isbn",
+    "invalid_number",
+    "invalid_timestamp",
+    "invalid_platform",
+    "invalid_url",
+    "formula_injection",
+    "duplicate_natural_key",
+    "edition_mismatch_suspected",
+    "unknown_column",
+    "field_too_long",
+    "invalid_mapping",
+    "reference_rights_unsupported",
+]
+
+
+class ImportRowDiagnostic(StrictModel):
+    row_number: int = Field(ge=1)
+    field: str | None = Field(default=None, max_length=100)
+    code: ImportRowCode
+    message: str = Field(max_length=500)
+    severity: Literal["error", "warning"]
+
+
+class ImportPreview(StrictModel):
+    id: UUID
+    owner_user_id: UUID
+    status: ImportStatus
+    filename: str = Field(max_length=200)
+    encoding_detected: Literal["utf8", "utf8_bom", "unknown"]
+    file_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    size_bytes: int = Field(ge=0)
+    columns: list[str]
+    total_rows: int = Field(ge=0)
+    parsed_rows: int = Field(ge=0)
+    valid_rows: int = Field(ge=0)
+    failed_rows: int = Field(ge=0)
+    skipped_duplicate_rows: int = Field(ge=0)
+    mapping_suggestions: dict[str, str | None]
+    row_diagnostics: list[ImportRowDiagnostic]
+    created_at: datetime
+    expires_at: datetime
+
+
+class ImportConfirm(StrictModel):
+    mapping: dict[str, str | None]
+    on_duplicate: Literal["skip", "update"] = "skip"
+    match_by: Literal["isbn", "isbn_and_edition", "title_author_fuzzy"] = "isbn_and_edition"
+    normalize_isbn: bool = True
+    note: str | None = Field(default=None, max_length=500)
+
+
+class ImportCounts(StrictModel):
+    total: int = Field(ge=0)
+    parsed: int = Field(ge=0)
+    persisted: int = Field(ge=0)
+    skipped_duplicate: int = Field(ge=0)
+    failed: int = Field(ge=0)
+    warnings: int = Field(ge=0)
+
+
+class ImportJob(StrictModel):
+    id: UUID
+    owner_user_id: UUID
+    status: ImportStatus
+    filename: str = Field(max_length=200)
+    file_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    created_at: datetime
+    updated_at: datetime
+    counts: ImportCounts
+    row_diagnostics: list[ImportRowDiagnostic]
+    entity_kinds: list[
+        Literal["book_edition", "promotion_candidate", "metric_observation", "evidence", "content_reference"]
+    ]
+    mapping: dict[str, str | None]
+    on_duplicate: Literal["skip", "update"]
+    match_by: Literal["isbn", "isbn_and_edition", "title_author_fuzzy"]
+
+
+class ImportPage(StrictModel):
+    items: list[ImportJob]
+    next_cursor: str | None
+
+
 def _timezone_aware(value: datetime | None) -> datetime | None:
     if value is not None and (
         value.tzinfo is None or value.utcoffset() is None

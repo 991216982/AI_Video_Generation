@@ -19,13 +19,24 @@ from book_video.api.schemas import (
     BookFactRevisionRequest,
     AudioAsset,
     CancelRequest,
+    ContentReference,
+    ContentReferencePage,
+    ContentReferenceCreate,
     CreativeProject,
     CreativeProjectCreate,
     CreativeProjectPage,
     CreativeWorkspace,
     Evidence,
     EvidenceCreate,
+    EvidencePage,
     GenerationResult,
+    ImportConfirm,
+    ImportJob,
+    ImportPage,
+    ImportPreview,
+    MetricObservation,
+    MetricObservationPage,
+    MetricObservationCreate,
     ModelCostRecord,
     PromotionCandidate,
     PromotionCandidateCreate,
@@ -38,6 +49,11 @@ from book_video.api.schemas import (
     RunCreate,
     ScriptVersion,
     ScriptVersionCreate,
+    StyleCard,
+    StyleCardPage,
+    StyleCardCreate,
+    StyleCardReview,
+    StyleCardUpdate,
 )
 from book_video.domain.errors import DomainError
 from book_video.domain.service import DomainService, SubmissionHook
@@ -199,6 +215,133 @@ def create_api_router(
     )
     def create_evidence(data: EvidenceCreate) -> dict:
         return domain.create_evidence(data)
+
+    @router.get("/evidence", operation_id="listEvidence", response_model=EvidencePage)
+    def list_evidence(
+        limit: int = Query(default=20, ge=1, le=100),
+        cursor: str | None = Query(default=None, min_length=1),
+        source_type: str | None = Query(default=None, enum=["manual", "licensed"]),
+        q: str | None = Query(default=None, max_length=100),
+    ) -> dict:
+        return domain.list_evidence(limit=limit, cursor=cursor, source_type=source_type, q=q)
+
+    @router.get("/metrics", operation_id="listMetricObservations", response_model=MetricObservationPage)
+    def list_metrics(
+        limit: int = Query(default=20, ge=1, le=100),
+        cursor: str | None = Query(default=None, min_length=1),
+        platform: str | None = Query(default=None, enum=["douyin", "kuaishou"]),
+        object_type: str | None = Query(default=None, enum=["product_listing", "creator_account", "content_item", "book_edition"]),
+        metric_name: str | None = Query(default=None),
+        basis: str | None = Query(default=None),
+        book_id: UUID | None = Query(default=None),
+    ) -> dict:
+        return domain.list_metric_observations(
+            limit=limit, cursor=cursor, platform=platform, object_type=object_type,
+            metric_name=metric_name, basis=basis, book_id=book_id,
+        )
+
+    @router.post(
+        "/metrics", operation_id="createMetricObservation",
+        response_model=MetricObservation, status_code=201,
+    )
+    def create_metric(data: MetricObservationCreate) -> dict:
+        return domain.create_metric_observation(data)
+
+    @router.get("/metrics/{observation_id}", operation_id="getMetricObservation",
+                response_model=MetricObservation)
+    def get_metric(observation_id: UUID) -> dict:
+        return domain.get_metric_observation(observation_id)
+
+    @router.get("/content-references", operation_id="listContentReferences",
+                response_model=ContentReferencePage)
+    def list_content_references(
+        limit: int = Query(default=20, ge=1, le=100),
+        cursor: str | None = Query(default=None, min_length=1),
+        platform: str | None = Query(default=None, enum=["douyin", "kuaishou"]),
+        ref_type: str | None = Query(default=None, enum=["product_listing", "creator_account", "content_item", "book_edition"]),
+        book_id: UUID | None = Query(default=None),
+    ) -> dict:
+        return domain.list_content_references(
+            limit=limit, cursor=cursor, platform=platform, ref_type=ref_type, book_id=book_id,
+        )
+
+    @router.post(
+        "/content-references", operation_id="createContentReference",
+        response_model=ContentReference, status_code=201,
+    )
+    def create_content_reference(data: ContentReferenceCreate) -> dict:
+        return domain.create_content_reference(data)
+
+    @router.get("/content-references/{reference_id}", operation_id="getContentReference",
+                response_model=ContentReference)
+    def get_content_reference(reference_id: UUID) -> dict:
+        return domain.get_content_reference(reference_id)
+
+    @router.get("/style-cards", operation_id="listStyleCards", response_model=StyleCardPage)
+    def list_style_cards(
+        limit: int = Query(default=20, ge=1, le=100),
+        cursor: str | None = Query(default=None, min_length=1),
+        review_status: str | None = Query(default=None, enum=["draft", "pending_review", "approved", "rejected"]),
+        target_platform: str | None = Query(default=None, enum=["douyin", "kuaishou"]),
+        book_id: UUID | None = Query(default=None),
+    ) -> dict:
+        return domain.list_style_cards(
+            limit=limit, cursor=cursor, review_status=review_status,
+            target_platform=target_platform, book_id=book_id,
+        )
+
+    @router.post(
+        "/style-cards", operation_id="createStyleCard",
+        response_model=StyleCard, status_code=201,
+    )
+    def create_style_card(data: StyleCardCreate) -> dict:
+        return domain.create_style_card(data)
+
+    @router.get("/style-cards/{style_card_id}", operation_id="getStyleCard", response_model=StyleCard)
+    def get_style_card(style_card_id: UUID) -> dict:
+        return domain.get_style_card(style_card_id)
+
+    @router.patch("/style-cards/{style_card_id}", operation_id="updateStyleCard", response_model=StyleCard)
+    def update_style_card(style_card_id: UUID, data: StyleCardUpdate) -> dict:
+        return domain.update_style_card(style_card_id, data)
+
+    @router.post("/style-cards/{style_card_id}/review", operation_id="reviewStyleCard",
+                 response_model=StyleCard)
+    def review_style_card(style_card_id: UUID, data: StyleCardReview) -> dict:
+        return domain.review_style_card(style_card_id, data)
+
+    @router.get("/imports", operation_id="listImports", response_model=ImportPage)
+    def list_imports(
+        limit: int = Query(default=20, ge=1, le=100),
+        cursor: str | None = Query(default=None, min_length=1),
+        status: str | None = Query(default=None, enum=["preview", "applied", "partially_applied", "failed"]),
+    ) -> dict:
+        return domain.list_imports(limit=limit, cursor=cursor, status=status)
+
+    @router.post(
+        "/imports/preview", operation_id="previewImport",
+        response_model=ImportPreview, status_code=200,
+    )
+    async def preview_import(
+        file: UploadFile = File(),
+        filename_hint: str | None = Form(default=None, max_length=200),
+        idempotency_key: str = Header(alias="Idempotency-Key", min_length=8, max_length=128),
+    ) -> dict:
+        content = await file.read(1024 * 1024 + 1)
+        result = domain.preview_import(content, filename_hint=filename_hint, idempotency_key=idempotency_key)
+        return {k: v for k, v in result.items() if k != "draft"}
+
+    @router.get("/imports/{import_id}", operation_id="getImport", response_model=ImportJob)
+    def get_import(import_id: UUID) -> dict:
+        return domain.get_import(import_id)
+
+    @router.post("/imports/{import_id}/confirm", operation_id="confirmImport", response_model=ImportJob)
+    def confirm_import(
+        import_id: UUID,
+        data: ImportConfirm,
+        idempotency_key: str = Header(alias="Idempotency-Key", min_length=8, max_length=128),
+    ) -> dict:
+        return domain.confirm_import(import_id, data, idempotency_key)
 
     @router.post(
         "/creative-projects",

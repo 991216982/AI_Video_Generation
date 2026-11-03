@@ -220,6 +220,7 @@ def _build_segments(
     fact: Mapping[str, str],
     opinion: str,
     duration: int,
+    style_keys: frozenset[str] = frozenset(),
 ) -> list[dict[str, Any]]:
     if variant == "A":
         content = [
@@ -236,7 +237,31 @@ def _build_segments(
             ("把它当作一个问题，试着找到你的答案。", "把它当作一个问题，试着找到你的答案。", []),
         ]
 
+    # Only fixed, generic patterns are applied. Source notes and third-party
+    # wording never enter the segments, and the verified fact stays attached.
+    if "opening_hook" in style_keys:
+        content[0] = (
+            "今天的一次选择，你会从哪里开始？",
+            "今天的一次选择，你会从哪里开始？先看这本书和我的一点体会。",
+            [],
+        )
+    if "tone" in style_keys:
+        opinion_index = 2 if variant == "A" else 1
+        content[opinion_index] = (opinion, f"我自己的看法是：{opinion}", [])
+    if "cta" in style_keys:
+        content[-1] = (
+            "你会选哪一步？",
+            "你会选哪一步？欢迎分享自己的方法。",
+            [],
+        )
+    if "subtitle_style" in style_keys:
+        fact_index = 1 if variant == "A" else 2
+        _, narration, fact_keys = content[fact_index]
+        content[fact_index] = (f"已核对：{fact['key']}", narration, fact_keys)
+
     weights = [0.16, 0.22, 0.38, 0.24]
+    if "pacing" in style_keys:
+        weights = [0.19, 0.24, 0.34, 0.23]
     durations = [round(duration * weight, 3) for weight in weights[:-1]]
     durations.append(round(duration - sum(durations), 3))
     return [
@@ -318,6 +343,11 @@ def _make_scripts(snapshot: Mapping[str, Any], run_id: str) -> list[dict[str, An
     book = snapshot["book"]
     fact = _verified_metadata_fact(book)
     opinion = str(book["original_opinion"]).strip()
+    style_keys = frozenset(
+        str(item.get("feature_key"))
+        for item in snapshot.get("style_guidance", [])
+        if isinstance(item, Mapping) and int(item.get("sample_count") or 0) >= 1
+    )
     prohibited = [str(item).strip().casefold() for item in project.get("prohibited_claims", []) if str(item).strip()]
     candidates = [
         {
@@ -340,6 +370,7 @@ def _make_scripts(snapshot: Mapping[str, Any], run_id: str) -> list[dict[str, An
             fact=fact,
             opinion=opinion,
             duration=project["desired_seconds"],
+            style_keys=style_keys,
         )
         script_text = "\n".join(
             [item["title_suggestion"], item["description_suggestion"]]
@@ -776,6 +807,7 @@ def create_script_generation_graph(
                     for fact in snapshot["book"].get("facts", [])
                     if isinstance(fact, Mapping) and _fact_has_basis(fact)
                 ],
+                "style_guidance": list(snapshot.get("style_guidance", [])),
             }
             response: ModelResponse | None = None
             invocation_key = context["invocation_key"]

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
@@ -13,10 +14,13 @@ import binascii
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
 from book_video.api.schemas import ScriptVersionCreate
+from book_video.connectors.manual import import_csv
 from book_video.domain.errors import DomainError, conflict, not_found
+from book_video.workflows.style_extraction import extract_style_features, style_guidance
 from book_video.domain.state import (
     RunEventType,
     RunStage,
@@ -560,6 +564,884 @@ class DomainService:
                 (evidence_id, self.owner_user_id, collected_at, _json(result)),
             )
         return result
+
+    def list_evidence(
+        self, *, limit: int = 20, cursor: str | None = None,
+        source_type: str | None = None, q: str | None = None,
+    ) -> JsonObject:
+        self._validate_page_limit(limit)
+        normalized_query = (q or "").strip().casefold() or None
+        if normalized_query and len(normalized_query) > 100:
+            raise DomainError(422, "invalid_query", "Evidence search query is too long")
+        filters = {"resource": "evidence", "source_type": source_type, "q": normalized_query}
+        position = self._decode_page_cursor(cursor, filters) if cursor else None
+        sql = "SELECT id, collected_at AS created_at, payload FROM evidence WHERE owner_user_id = ?"
+        args: list[Any] = [self.owner_user_id]
+        if source_type is not None:
+            sql += " AND json_extract(payload, '$.source_type') = ?"
+            args.append(source_type)
+        if position:
+            sql += " AND (collected_at < ? OR (collected_at = ? AND id < ?))"
+            args.extend([position["created_at"], position["created_at"], position["id"]])
+        sql += " ORDER BY collected_at DESC, id DESC"
+        with self.database.read() as conn:
+            rows = conn.execute(sql, args).fetchall()
+        matching: list[tuple[Any, JsonObject]] = []
+        for row in rows:
+            record = _payload(row)
+            if normalized_query is not None:
+                searchable = " ".join(
+                    str(record.get(field) or "") for field in ("source_note", "source_url")
+                ).casefold()
+                if normalized_query not in searchable:
+                    continue
+            matching.append((row, record))
+        page = matching[:limit]
+        next_cursor = (
+            self._encode_page_cursor(filters, page[-1][0])
+            if len(matching) > limit and page else None
+        )
+        return {"items": [record for _row, record in page], "next_cursor": next_cursor}
+
+    # --- W4-A: metric observations ---
+
+    _WINDOWED_BASES = {
+        "authorized_order_sales", "third_party_or_manual_estimate", "engagement_signal",
+    }
+
+    def create_metric_observation(self, data: Any) -> JsonObject:
+        record = _dump(data)
+        evidence_id = record.get("evidence_id")
+        value = record.get("value")
+        missing_reason = record.get("missing_reason")
+        if value is None and not (missing_reason or "").strip():
+            raise DomainError(422, "missing_reason_required", "Missing metric values must include a reason")
+        if value is not None and evidence_id is None:
+            raise DomainError(422, "validation_error", "A numeric observation requires an evidence record")
+        if value is not None and missing_reason is not None:
+            raise DomainError(422, "validation_error", "A valued observation must not carry a missing reason")
+        if value is not None and not math.isfinite(value):
+            raise DomainError(422, "validation_error", "Metric value must be finite")
+        window_start = _timestamp(record["window_start"]) if record.get("window_start") else None
+        window_end = _timestamp(record["window_end"]) if record.get("window_end") else None
+        if (window_start is None) != (window_end is None):
+            raise DomainError(422, "validation_error", "window_start and window_end must both be present or absent")
+        if window_start and window_end and window_start > window_end:
+            raise DomainError(422, "validation_error", "window_start must not follow window_end")
+        if record["basis"] in self._WINDOWED_BASES and (window_start is None or window_end is None):
+            raise DomainError(422, "validation_error", f"{record['basis']} observations require a time window")
+        observed_at = _timestamp(record["observed_at"])
+        if observed_at > datetime.now(timezone.utc):
+            raise DomainError(422, "invalid_observed_at", "observed_at cannot be in the future")
+        expires_at = _timestamp(record["expires_at"]) if record.get("expires_at") else None
+        book_id = _as_uuid(record["book_id"]) if record.get("book_id") else None
+        with self.database.transaction() as conn:
+            if evidence_id and self._get(conn, "evidence", evidence_id) is None:
+                raise not_found("Evidence")
+            if book_id and self._get(conn, "books", book_id) is None:
+                raise not_found("Book edition")
+            observation_id = str(uuid4())
+            collected_at = _utc_now()
+            result = {
+                **record,
+                "platform": record.get("platform"),
+                "book_id": book_id,
+                "window_start": window_start.isoformat().replace("+00:00", "Z") if window_start else None,
+                "window_end": window_end.isoformat().replace("+00:00", "Z") if window_end else None,
+                "observed_at": observed_at.isoformat().replace("+00:00", "Z"),
+                "expires_at": expires_at.isoformat().replace("+00:00", "Z") if expires_at else None,
+                "evidence_id": _as_uuid(evidence_id) if evidence_id else None,
+                "id": observation_id,
+                "owner_user_id": self.owner_user_id,
+                "collected_at": collected_at,
+                "legacy_backfill": False,
+            }
+            conn.execute(
+                "INSERT INTO metric_observations(id, owner_user_id, collected_at, payload) "
+                "VALUES (?, ?, ?, ?)",
+                (observation_id, self.owner_user_id, collected_at, _json(result)),
+            )
+        return result
+
+    def get_metric_observation(self, observation_id: UUID | str) -> JsonObject:
+        return self._get_or_404("metric_observations", observation_id, "Metric observation")
+
+    def list_metric_observations(
+        self, *, limit: int = 20, cursor: str | None = None, platform: str | None = None,
+        object_type: str | None = None, metric_name: str | None = None,
+        basis: str | None = None, book_id: UUID | str | None = None,
+    ) -> JsonObject:
+        self._validate_page_limit(limit)
+        book_key = _as_uuid(book_id) if book_id is not None else None
+        filters = {"resource": "metric_observations", "platform": platform, "object_type": object_type,
+                   "metric_name": metric_name, "basis": basis, "book_id": book_key}
+        position = self._decode_page_cursor(cursor, filters) if cursor else None
+        sql = ("SELECT id, json_extract(payload, '$.observed_at') AS created_at, payload "
+               "FROM metric_observations WHERE owner_user_id = ?")
+        args: list[Any] = [self.owner_user_id]
+        for field, value in (("platform", platform), ("object_type", object_type),
+                             ("metric_name", metric_name), ("basis", basis), ("book_id", book_key)):
+            if value is not None:
+                sql += f" AND json_extract(payload, '$.{field}') = ?"
+                args.append(value)
+        observed = "json_extract(payload, '$.observed_at')"
+        if position:
+            sql += f" AND ({observed} < ? OR ({observed} = ? AND id < ?))"
+            args.extend([position["created_at"], position["created_at"], position["id"]])
+        sql += f" ORDER BY {observed} DESC, id DESC"
+        with self.database.read() as conn:
+            rows = conn.execute(sql, args).fetchall()
+        page_rows = rows[: limit + 1]
+        has_more = len(page_rows) > limit
+        page_rows = page_rows[:limit]
+        return {
+            "items": [_payload(row) for row in page_rows],
+            "next_cursor": self._encode_page_cursor(filters, page_rows[-1]) if has_more and page_rows else None,
+        }
+
+    # --- W4-A: content references ---
+
+    def create_content_reference(self, data: Any) -> JsonObject:
+        record = _dump(data)
+        self._validate_web_uri(record.get("reference_url"), "reference_url")
+        evidence_ids = [_as_uuid(item) for item in record.get("evidence_ids", [])]
+        book_id = _as_uuid(record["book_id"]) if record.get("book_id") else None
+        observed_at = _timestamp(record["observed_at"]) if record.get("observed_at") else None
+        if record.get("material_statement") != "no_third_party_media_or_verbatim_transcript":
+            raise DomainError(422, "validation_error", "Material rights declaration is required")
+        with self.database.transaction() as conn:
+            for evidence_id in evidence_ids:
+                if self._get(conn, "evidence", evidence_id) is None:
+                    raise not_found("Evidence")
+            if book_id and self._get(conn, "books", book_id) is None:
+                raise not_found("Book edition")
+            reference_id = str(uuid4())
+            created_at = _utc_now()
+            result = {
+                **record,
+                "book_id": book_id,
+                "evidence_ids": evidence_ids,
+                "observed_at": observed_at.isoformat().replace("+00:00", "Z") if observed_at else None,
+                "id": reference_id,
+                "owner_user_id": self.owner_user_id,
+                "created_at": created_at,
+            }
+            conn.execute(
+                "INSERT INTO content_references(id, owner_user_id, created_at, payload) "
+                "VALUES (?, ?, ?, ?)",
+                (reference_id, self.owner_user_id, created_at, _json(result)),
+            )
+        return result
+
+    def get_content_reference(self, reference_id: UUID | str) -> JsonObject:
+        return self._get_or_404("content_references", reference_id, "Content reference")
+
+    def list_content_references(
+        self, *, limit: int = 20, cursor: str | None = None, platform: str | None = None,
+        ref_type: str | None = None, book_id: UUID | str | None = None,
+    ) -> JsonObject:
+        self._validate_page_limit(limit)
+        book_key = _as_uuid(book_id) if book_id is not None else None
+        filters = {"resource": "content_references", "platform": platform, "ref_type": ref_type, "book_id": book_key}
+        position = self._decode_page_cursor(cursor, filters) if cursor else None
+        sql = "SELECT id, created_at, payload FROM content_references WHERE owner_user_id = ?"
+        args: list[Any] = [self.owner_user_id]
+        for field, value in (("platform", platform), ("ref_type", ref_type), ("book_id", book_key)):
+            if value is not None:
+                sql += f" AND json_extract(payload, '$.{field}') = ?"
+                args.append(value)
+        if position:
+            sql += " AND (created_at < ? OR (created_at = ? AND id < ?))"
+            args.extend([position["created_at"], position["created_at"], position["id"]])
+        sql += " ORDER BY created_at DESC, id DESC"
+        with self.database.read() as conn:
+            rows = conn.execute(sql, args).fetchall()
+        page_rows = rows[: limit + 1]
+        has_more = len(page_rows) > limit
+        page_rows = page_rows[:limit]
+        return {
+            "items": [_payload(row) for row in page_rows],
+            "next_cursor": self._encode_page_cursor(filters, page_rows[-1]) if has_more and page_rows else None,
+        }
+
+    # --- W4-A: style cards ---
+
+    def _style_card_sample_count(self, card: JsonObject) -> int:
+        return len({str(item) for item in card.get("evidence_ids", [])})
+
+    def _validate_style_evidence(self, conn: Any, evidence_ids: list[str], reference_ids: list[str]) -> None:
+        for evidence_id in evidence_ids:
+            if self._get(conn, "evidence", evidence_id) is None:
+                raise not_found("Evidence")
+        for reference_id in reference_ids:
+            if self._get(conn, "content_references", reference_id) is None:
+                raise not_found("Content reference")
+
+    @staticmethod
+    def _validate_style_features(features: list[JsonObject], evidence_ids: list[str]) -> None:
+        evidence_set = {str(item) for item in evidence_ids}
+        for feature in features:
+            cited = {str(item) for item in feature.get("evidence_ids", [])}
+            if not cited or not cited <= evidence_set:
+                raise DomainError(422, "validation_error", "Every feature must cite evidence on its card")
+            if int(feature.get("sample_count", 0)) != len(cited):
+                raise DomainError(422, "validation_error", "Feature sample count must equal distinct cited evidence")
+
+    def create_style_card(self, data: Any) -> JsonObject:
+        record = _dump(data)
+        book_id = _as_uuid(record["book_id"]) if record.get("book_id") else None
+        derived_by = record.get("derived_by") or "manual"
+        with self.database.transaction() as conn:
+            self._validate_style_evidence(conn, record.get("evidence_ids", []), record.get("reference_ids", []))
+            if book_id and self._get(conn, "books", book_id) is None:
+                raise not_found("Book edition")
+            evidence_ids = [_as_uuid(item) for item in record.get("evidence_ids", [])]
+            reference_ids = [_as_uuid(item) for item in record.get("reference_ids", [])]
+
+            if derived_by == "workflow_extraction":
+                # Features for workflow-derived cards are recomputed server-side
+                # from the owner-scoped evidence and references; client-supplied
+                # feature lists are never trusted as extraction output.
+                evidence_records: list[JsonObject] = []
+                for evidence_id in evidence_ids:
+                    record_row = self._get(conn, "evidence", evidence_id)
+                    if record_row is not None:
+                        evidence_records.append({**record_row, "kind": "evidence"})
+                reference_records: list[JsonObject] = []
+                for reference_id in reference_ids:
+                    record_row = self._get(conn, "content_references", reference_id)
+                    if record_row is not None:
+                        reference_records.append({**record_row, "kind": "reference"})
+                features, extracted_evidence, extracted_references = extract_style_features(
+                    evidence_records + reference_records,
+                )
+                evidence_ids = [_as_uuid(item) for item in extracted_evidence]
+                reference_ids = [_as_uuid(item) for item in extracted_references]
+            else:
+                features = record.get("features", [])
+            self._validate_style_features(features, evidence_ids)
+
+            card_id = str(uuid4())
+            now = _utc_now()
+            has_evidence = bool(evidence_ids) and bool(features)
+            result = {
+                **record,
+                "derived_by": derived_by,
+                "book_id": book_id,
+                "features": features,
+                "evidence_ids": evidence_ids,
+                "reference_ids": reference_ids,
+                "id": card_id,
+                "owner_user_id": self.owner_user_id,
+                "created_at": now,
+                "updated_at": now,
+                "revision": 1,
+                "review_status": "pending_review" if has_evidence else "draft",
+                "edited_by_user_id": None,
+                "last_edited_at": None,
+                "abstract_only": True,
+                "evidence_sample_count": self._style_card_sample_count({"evidence_ids": evidence_ids}),
+            }
+            conn.execute(
+                "INSERT INTO style_cards(id, owner_user_id, created_at, payload) VALUES (?, ?, ?, ?)",
+                (card_id, self.owner_user_id, now, _json(result)),
+            )
+        return result
+
+    def get_style_card(self, style_card_id: UUID | str) -> JsonObject:
+        return self._get_or_404("style_cards", style_card_id, "Style card")
+
+    def list_style_cards(
+        self, *, limit: int = 20, cursor: str | None = None,
+        review_status: str | None = None, target_platform: str | None = None,
+        book_id: UUID | str | None = None,
+    ) -> JsonObject:
+        self._validate_page_limit(limit)
+        book_key = _as_uuid(book_id) if book_id is not None else None
+        filters = {"resource": "style_cards", "review_status": review_status,
+                   "target_platform": target_platform, "book_id": book_key}
+        position = self._decode_page_cursor(cursor, filters) if cursor else None
+        sql = "SELECT id, created_at, payload FROM style_cards WHERE owner_user_id = ?"
+        args: list[Any] = [self.owner_user_id]
+        for field, value in (("review_status", review_status), ("target_platform", target_platform), ("book_id", book_key)):
+            if value is not None:
+                sql += f" AND json_extract(payload, '$.{field}') = ?"
+                args.append(value)
+        if position:
+            sql += " AND (created_at < ? OR (created_at = ? AND id < ?))"
+            args.extend([position["created_at"], position["created_at"], position["id"]])
+        sql += " ORDER BY created_at DESC, id DESC"
+        with self.database.read() as conn:
+            rows = conn.execute(sql, args).fetchall()
+        page_rows = rows[: limit + 1]
+        has_more = len(page_rows) > limit
+        page_rows = page_rows[:limit]
+        return {
+            "items": [_payload(row) for row in page_rows],
+            "next_cursor": self._encode_page_cursor(filters, page_rows[-1]) if has_more and page_rows else None,
+        }
+
+    def update_style_card(self, style_card_id: UUID | str, data: Any) -> JsonObject:
+        card_key = _as_uuid(style_card_id)
+        update = _dump(data)
+        expected_revision = update["expected_revision"]
+        with self.database.transaction() as conn:
+            row = self._get_row(conn, "style_cards", card_key)
+            if row is None:
+                raise not_found("Style card")
+            current = _payload(row)
+            if int(current["revision"]) != expected_revision:
+                raise conflict("revision_conflict", "Style card changed since it was loaded",
+                              expected_revision=expected_revision, current_revision=current["revision"])
+            evidence_ids = (
+                [_as_uuid(item) for item in update["evidence_ids"]]
+                if update.get("evidence_ids") is not None else list(current["evidence_ids"])
+            )
+            reference_ids = (
+                [_as_uuid(item) for item in update["reference_ids"]]
+                if update.get("reference_ids") is not None else list(current["reference_ids"])
+            )
+            features = update["features"] if update.get("features") is not None else current.get("features", [])
+            self._validate_style_features(features, evidence_ids)
+            self._validate_style_evidence(conn, evidence_ids, reference_ids)
+            now = _utc_now()
+            result = {
+                **current,
+                "title": update.get("title", current["title"]),
+                "target_platform": update.get("target_platform", current.get("target_platform")),
+                "features": features,
+                "evidence_ids": evidence_ids,
+                "reference_ids": reference_ids,
+                "human_note": update.get("human_note", current.get("human_note")),
+                "revision": int(current["revision"]) + 1,
+                "updated_at": now,
+                "edited_by_user_id": self.owner_user_id,
+                "last_edited_at": now,
+                "evidence_sample_count": self._style_card_sample_count({"evidence_ids": evidence_ids}),
+            }
+            if current["review_status"] == "approved":
+                # Human revision after approval returns the card to pending review.
+                result["review_status"] = "pending_review"
+            conn.execute(
+                "UPDATE style_cards SET payload = ? WHERE id = ? AND owner_user_id = ?",
+                (_json(result), card_key, self.owner_user_id),
+            )
+        return result
+
+    def review_style_card(self, style_card_id: UUID | str, data: Any) -> JsonObject:
+        card_key = _as_uuid(style_card_id)
+        review = _dump(data)
+        decision = review["decision"]
+        note = review.get("note")
+        if decision == "reject" and not (note or "").strip():
+            raise DomainError(422, "validation_error", "A rejected style card requires a note")
+        with self.database.transaction() as conn:
+            row = self._get_row(conn, "style_cards", card_key)
+            if row is None:
+                raise not_found("Style card")
+            current = _payload(row)
+            if decision == "approve":
+                if not current.get("evidence_ids") or not current.get("features"):
+                    raise DomainError(422, "validation_error", "Approval requires at least one evidence-backed feature")
+                self._validate_style_evidence(conn, current["evidence_ids"], current.get("reference_ids", []))
+                self._validate_style_features(current["features"], current["evidence_ids"])
+            now = _utc_now()
+            result = {
+                **current,
+                "review_status": "approved" if decision == "approve" else "rejected",
+                "human_note": note if note is not None else current.get("human_note"),
+                "updated_at": now,
+                "edited_by_user_id": self.owner_user_id,
+                "last_edited_at": now,
+            }
+            conn.execute(
+                "UPDATE style_cards SET payload = ? WHERE id = ? AND owner_user_id = ?",
+                (_json(result), card_key, self.owner_user_id),
+            )
+        return result
+
+    def create_workflow_style_card(
+        self, *, title: str | None = None, book_id: UUID | str | None = None,
+        evidence_ids: list[UUID | str] | None = None,
+        reference_ids: list[UUID | str] | None = None,
+    ) -> JsonObject:
+        """Build an evidence-backed style card from the extraction workflow.
+
+        The card always starts as a draft or pending review; a human must approve
+        it before it can influence script generation.
+        """
+        evidence_keys = [_as_uuid(item) for item in (evidence_ids or [])]
+        reference_keys = [_as_uuid(item) for item in (reference_ids or [])]
+        book_key = _as_uuid(book_id) if book_id else None
+        with self.database.transaction() as conn:
+            evidence_records: list[JsonObject] = []
+            for evidence_id in evidence_keys:
+                record = self._get(conn, "evidence", evidence_id)
+                if record is None:
+                    raise not_found("Evidence")
+                evidence_records.append({**record, "kind": "evidence"})
+            reference_records: list[JsonObject] = []
+            for reference_id in reference_keys:
+                record = self._get(conn, "content_references", reference_id)
+                if record is None:
+                    raise not_found("Content reference")
+                reference_records.append({**record, "kind": "reference"})
+            if book_key and self._get(conn, "books", book_key) is None:
+                raise not_found("Book edition")
+
+        features, extracted_evidence, extracted_references = extract_style_features(
+            evidence_records + reference_records,
+        )
+        auto_title = (title or "").strip() or "证据提炼的抽象风格（待人工审核）"
+        payload = {
+            "title": auto_title,
+            "target_platform": None,
+            "book_id": book_key,
+            "derived_by": "workflow_extraction",
+            "features": features,
+            "evidence_ids": extracted_evidence,
+            "reference_ids": extracted_references,
+            "human_note": "由证据与内容参考自动提炼；特征为抽象模式，需人工核对后才能作为创作参考。",
+        }
+        return self.create_style_card(payload)
+
+    def list_approved_style_guidance(self, book_id: UUID | str | None = None) -> list[dict[str, Any]]:
+        """Approved, abstract style hints available to script generation."""
+        book_key = _as_uuid(book_id) if book_id else None
+        with self.database.read() as conn:
+            rows = conn.execute(
+                "SELECT payload FROM style_cards WHERE owner_user_id = ? "
+                "AND json_extract(payload, '$.review_status') = 'approved'",
+                (self.owner_user_id,),
+            ).fetchall()
+        guidance: list[dict[str, Any]] = []
+        for row in rows:
+            card = _payload(row)
+            if book_key and card.get("book_id") and card["book_id"] != book_key:
+                continue
+            guidance.extend(style_guidance(card.get("features", [])))
+        # De-duplicate by feature key, keeping the highest sample count.
+        merged: dict[str, dict[str, Any]] = {}
+        for item in guidance:
+            existing = merged.get(item["feature_key"])
+            if existing is None or item["sample_count"] > existing["sample_count"]:
+                merged[item["feature_key"]] = item
+        return sorted(merged.values(), key=lambda item: item["feature_key"])
+
+    @staticmethod
+    def _validate_web_uri(value: str | None, field_name: str) -> None:
+        if value is None:
+            return
+        parsed = urlsplit(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise DomainError(422, "validation_error", f"{field_name} must be an absolute http(s) URI")
+
+    # --- W4-A: CSV import jobs ---
+
+    PREVIEW_TTL_SECONDS = 3600
+
+    _PREVIEW_FIELDS = {
+        "id", "owner_user_id", "status", "filename", "encoding_detected", "file_sha256",
+        "size_bytes", "columns", "total_rows", "parsed_rows", "valid_rows", "failed_rows",
+        "skipped_duplicate_rows", "mapping_suggestions", "row_diagnostics", "created_at",
+        "expires_at",
+    }
+    _JOB_FIELDS = {
+        "id", "owner_user_id", "status", "filename", "file_sha256", "created_at",
+        "updated_at", "counts", "row_diagnostics", "entity_kinds", "mapping",
+        "on_duplicate", "match_by",
+    }
+
+    @classmethod
+    def _preview_response(cls, payload: JsonObject) -> JsonObject:
+        return {k: v for k, v in payload.items() if k in cls._PREVIEW_FIELDS}
+
+    @classmethod
+    def _job_response(cls, payload: JsonObject) -> JsonObject:
+        return {k: v for k, v in payload.items() if k in cls._JOB_FIELDS}
+
+    def preview_import(
+        self, content: bytes, *, filename_hint: str | None, idempotency_key: str
+    ) -> JsonObject:
+        self._validate_idempotency_key(idempotency_key)
+        if len(content) > 1024 * 1024:
+            raise DomainError(422, "import_file_too_large", "CSV file exceeds the 1 MiB size limit")
+        file_hash = hashlib.sha256(content).hexdigest()
+        filename = (filename_hint or "import.csv").strip()[:200] or "import.csv"
+        operation = "import_preview"
+        request_hash = _request_hash({"filename": filename, "file_sha256": file_hash})
+        with self.database.transaction() as conn:
+            replay = self._get_idempotent_mutation(conn, idempotency_key, operation, file_hash, request_hash)
+            if replay is not None:
+                return self._preview_response(replay)
+            parsed = import_csv.parse_csv(content, sha256=file_hash)
+            if len(parsed.rows) > import_csv.MAX_ROWS:
+                raise DomainError(422, "import_too_many_rows", f"CSV exceeds the {import_csv.MAX_ROWS}-row limit")
+            if parsed.encoding_failed:
+                diagnostics = [d.as_dict() for d in parsed.parse_diagnostics]
+                job_id = str(uuid4())
+                now = _utc_now()
+                result = {
+                    "id": job_id, "owner_user_id": self.owner_user_id, "status": "failed",
+                    "filename": filename, "file_sha256": file_hash, "created_at": now, "updated_at": now,
+                    "counts": {"total": 0, "parsed": 0, "persisted": 0, "skipped_duplicate": 0,
+                               "failed": 0, "warnings": 0},
+                    "total_rows": 0, "parsed_rows": 0, "valid_rows": 0, "failed_rows": 0,
+                    "skipped_duplicate_rows": 0,
+                    "row_diagnostics": diagnostics, "entity_kinds": [], "mapping": {},
+                    "on_duplicate": "skip", "match_by": "isbn_and_edition",
+                    "encoding_detected": parsed.encoding_detected, "size_bytes": parsed.size_bytes,
+                    "columns": parsed.columns, "mapping_suggestions": {},
+                    "expires_at": now, "draft": None,
+                }
+                conn.execute(
+                    "INSERT INTO import_jobs(id, owner_user_id, status, file_sha256, created_at, updated_at, payload) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (job_id, self.owner_user_id, "failed", file_hash, now, now, _json(result)),
+                )
+                self._store_idempotent_mutation(conn, idempotency_key, operation, file_hash, request_hash, result)
+                return self._preview_response(result)
+
+            suggestions = import_csv.suggest_mapping(parsed.columns)
+            _records, row_diagnostics, counts = import_csv.validate_rows(
+                parsed.rows, suggestions, match_by="isbn_and_edition", do_normalize_isbn=True,
+            )
+            job_id = str(uuid4())
+            now = _utc_now()
+            expires = (datetime.now(timezone.utc) + timedelta(seconds=self.PREVIEW_TTL_SECONDS))
+            expires_at = expires.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+            result = {
+                "id": job_id, "owner_user_id": self.owner_user_id, "status": "preview",
+                "filename": filename, "file_sha256": file_hash, "created_at": now, "updated_at": now,
+                "counts": {**counts, "persisted": 0},
+                "total_rows": counts["total"], "parsed_rows": counts["parsed"],
+                "valid_rows": counts["parsed"] - counts["failed"] - counts["skipped_duplicate"],
+                "failed_rows": counts["failed"],
+                "skipped_duplicate_rows": counts["skipped_duplicate"],
+                "row_diagnostics": [d.as_dict() for d in row_diagnostics],
+                "entity_kinds": [], "mapping": suggestions,
+                "on_duplicate": "skip", "match_by": "isbn_and_edition",
+                "encoding_detected": parsed.encoding_detected, "size_bytes": parsed.size_bytes,
+                "columns": parsed.columns, "mapping_suggestions": suggestions,
+                "expires_at": expires_at,
+                "draft": {"rows": parsed.rows, "parsed_count": len(parsed.rows)},
+            }
+            conn.execute(
+                "INSERT INTO import_jobs(id, owner_user_id, status, file_sha256, created_at, updated_at, payload) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (job_id, self.owner_user_id, "preview", file_hash, now, now, _json(result)),
+            )
+            self._store_idempotent_mutation(conn, idempotency_key, operation, file_hash, request_hash, result)
+        return self._preview_response(result)
+
+    def get_import(self, import_id: UUID | str) -> JsonObject:
+        job = self._get_or_404("import_jobs", import_id, "Import job")
+        return self._job_response(job)
+
+    def list_imports(
+        self, *, limit: int = 20, cursor: str | None = None, status: str | None = None
+    ) -> JsonObject:
+        self._validate_page_limit(limit)
+        filters = {"resource": "import_jobs", "status": status}
+        position = self._decode_page_cursor(cursor, filters) if cursor else None
+        sql = "SELECT id, created_at, payload FROM import_jobs WHERE owner_user_id = ?"
+        args: list[Any] = [self.owner_user_id]
+        if status is not None:
+            sql += " AND json_extract(payload, '$.status') = ?"
+            args.append(status)
+        if position:
+            sql += " AND (created_at < ? OR (created_at = ? AND id < ?))"
+            args.extend([position["created_at"], position["created_at"], position["id"]])
+        sql += " ORDER BY created_at DESC, id DESC"
+        with self.database.read() as conn:
+            rows = conn.execute(sql, args).fetchall()
+        page_rows = rows[: limit + 1]
+        has_more = len(page_rows) > limit
+        page_rows = page_rows[:limit]
+        items = [self._job_response(_payload(row)) for row in page_rows]
+        return {
+            "items": items,
+            "next_cursor": self._encode_page_cursor(filters, page_rows[-1]) if has_more and page_rows else None,
+        }
+
+    def confirm_import(
+        self, import_id: UUID | str, data: Any, idempotency_key: str
+    ) -> JsonObject:
+        job_key = _as_uuid(import_id)
+        request = _dump(data)
+        self._validate_idempotency_key(idempotency_key)
+        operation = "import_confirm"
+        request_hash = _request_hash({"import_id": job_key, **request})
+        with self.database.transaction() as conn:
+            replay = self._get_idempotent_mutation(
+                conn, idempotency_key, operation, job_key, request_hash
+            )
+            if replay is not None:
+                return self._job_response(replay)
+            row = self._get_row(conn, "import_jobs", job_key)
+            if row is None:
+                raise not_found("Import job")
+            draft = _payload(row)
+            if draft["status"] != "preview":
+                raise conflict("import_already_applied", "Import job has already been applied")
+            if draft.get("expires_at") and _timestamp(draft["expires_at"]) <= datetime.now(timezone.utc):
+                raise DomainError(422, "import_preview_expired", "Preview draft has expired; upload the file again")
+            mapping = request.get("mapping") or {}
+            unknown_sources = set(mapping) - set(draft.get("columns", []))
+            if unknown_sources:
+                raise DomainError(
+                    422, "import_mapping_invalid", "Mapping references unknown CSV columns",
+                    details={"columns": sorted(unknown_sources)},
+                )
+            unknown_targets = {
+                target for target in mapping.values()
+                if target is not None and target not in import_csv.VALID_MAPPING_TARGETS
+            }
+            if unknown_targets:
+                raise DomainError(422, "import_mapping_invalid", "Mapping references unknown target fields",
+                                  details={"targets": sorted(unknown_targets)})
+            chosen_targets = [target for target in mapping.values() if target is not None]
+            if len(chosen_targets) != len(set(chosen_targets)):
+                raise DomainError(422, "import_mapping_invalid", "Each target field may be mapped once")
+            confirm = {
+                "on_duplicate": request.get("on_duplicate", "skip"),
+                "match_by": request.get("match_by", "isbn_and_edition"),
+                "normalize_isbn": request.get("normalize_isbn", True),
+            }
+            draft_rows = (draft.get("draft") or {}).get("rows", [])
+            records, diagnostics, counts = import_csv.validate_rows(
+                draft_rows, mapping, match_by=confirm["match_by"], do_normalize_isbn=confirm["normalize_isbn"],
+            )
+            persisted: list[str] = []
+            entity_kinds: set[str] = set()
+
+            for record in records:
+                if record["error_count"] > 0:
+                    continue
+                draft_book = record["book"]
+                book_id: str | None = None
+                if draft_book.get("title") or draft_book.get("isbn"):
+                    book_id = self._import_upsert_book(conn, draft_book, confirm)
+                    if book_id:
+                        entity_kinds.add("book_edition")
+                if record["has_candidate"] and book_id and record["candidate"].get("platform"):
+                    candidate_id = self._import_upsert_candidate(conn, book_id, record["candidate"], confirm)
+                    if candidate_id:
+                        entity_kinds.add("promotion_candidate")
+                if record["has_reference"] and record["reference"].get("title"):
+                    reference_id = self._import_create_reference(conn, record["reference"], book_id)
+                    if reference_id:
+                        entity_kinds.add("content_reference")
+                if record["has_metric"]:
+                    metric_id = self._import_create_metric(
+                        conn, record["metric"], book_id, draft["file_sha256"]
+                    )
+                    if metric_id:
+                        entity_kinds.add("metric_observation")
+                        if record["metric"].get("value") is not None:
+                            entity_kinds.add("evidence")
+
+            failed = sum(1 for r in records if r["error_count"] > 0)
+            persisted_count = len(records) - failed - counts["skipped_duplicate"]
+            warnings = sum(1 for d in diagnostics if d.severity == "warning")
+            if failed == 0:
+                status = "applied"
+            elif persisted_count > 0:
+                status = "partially_applied"
+            else:
+                status = "failed"
+            now = _utc_now()
+            result = {
+                **draft,
+                "status": status,
+                "updated_at": now,
+                "counts": {"total": counts["total"], "parsed": counts["parsed"],
+                           "persisted": max(persisted_count, 0),
+                           "skipped_duplicate": counts["skipped_duplicate"], "failed": failed,
+                           "warnings": warnings},
+                "row_diagnostics": [d.as_dict() for d in diagnostics],
+                "entity_kinds": sorted(entity_kinds),
+                "mapping": mapping,
+                "on_duplicate": confirm["on_duplicate"],
+                "match_by": confirm["match_by"],
+            }
+            conn.execute(
+                "UPDATE import_jobs SET status = ?, file_sha256 = ?, updated_at = ?, payload = ? "
+                "WHERE id = ? AND owner_user_id = ?",
+                (status, draft["file_sha256"], now, _json(result), job_key, self.owner_user_id),
+            )
+            self._store_idempotent_mutation(conn, idempotency_key, operation, job_key, request_hash, result)
+        return self._job_response(result)
+
+    def _import_upsert_book(
+        self, conn: Any, draft: JsonObject, confirm: JsonObject
+    ) -> str | None:
+        isbn = import_csv.normalize_isbn(draft.get("isbn")) if confirm["normalize_isbn"] else draft.get("isbn")
+        title = (draft.get("title") or "").strip()
+        edition = (draft.get("edition_label") or "").strip()
+        author = (draft.get("author") or "").strip()
+        if not title:
+            return None
+        existing = conn.execute(
+            "SELECT id, payload FROM books WHERE owner_user_id = ?", (self.owner_user_id,)
+        ).fetchall()
+        for row in existing:
+            book = _payload(row)
+            match = False
+            if confirm["match_by"] == "isbn" and isbn:
+                match = (book.get("isbn") or "").replace("-", "").upper() == isbn
+            elif confirm["match_by"] == "title_author_fuzzy" or not isbn:
+                match = (book.get("title", "").casefold() == title.casefold()
+                         and book.get("author", "").casefold() == author.casefold()
+                         and book.get("edition_label", "").casefold() == edition.casefold())
+            else:
+                match = ((book.get("isbn") or "").replace("-", "").upper() == isbn
+                         and book.get("edition_label", "").casefold() == edition.casefold())
+            if match:
+                if edition and (book.get("edition_label") or "").casefold() != edition.casefold():
+                    raise DomainError(
+                        422, "edition_conflict", "Matched ISBN belongs to a different edition",
+                    )
+                if confirm["on_duplicate"] == "update":
+                    updated = {**book, "title": title, "edition_label": edition or book.get("edition_label"),
+                               "author": author or book.get("author"),
+                               "publisher": draft.get("publisher") or book.get("publisher")}
+                    conn.execute("UPDATE books SET payload = ? WHERE id = ? AND owner_user_id = ?",
+                                 (_json(updated), row["id"], self.owner_user_id))
+                return row["id"]
+        book_id = str(uuid4())
+        now = _utc_now()
+        opinion = (draft.get("original_opinion") or "").strip() or "CSV 导入的图书，待创作者补充原创观点。"
+        payload = {
+            "id": book_id, "owner_user_id": self.owner_user_id, "created_at": now,
+            "title": title, "edition_label": edition or "未注明版次", "author": author or "佚名",
+            "isbn": isbn, "publisher": draft.get("publisher") or None,
+            "original_opinion": opinion, "facts": [],
+        }
+        conn.execute(
+            "INSERT INTO books(id, owner_user_id, created_at, payload) VALUES (?, ?, ?, ?)",
+            (book_id, self.owner_user_id, now, _json(payload)),
+        )
+        return book_id
+
+    def _import_upsert_candidate(
+        self, conn: Any, book_id: str, draft: JsonObject, confirm: JsonObject
+    ) -> str | None:
+        product_id = draft.get("platform_product_id")
+        product_url = draft.get("product_url")
+        platform = draft.get("platform")
+        if not product_id or not product_url or platform not in import_csv.PLATFORMS:
+            return None
+        existing = conn.execute(
+            "SELECT id, payload FROM promotion_candidates WHERE owner_user_id = ? AND book_id = ?",
+            (self.owner_user_id, book_id),
+        ).fetchall()
+        for row in existing:
+            candidate = _payload(row)
+            if candidate.get("platform_product_id") == product_id and candidate.get("platform") == platform:
+                return row["id"]
+        candidate_id = str(uuid4())
+        now = _utc_now()
+        payload = {
+            "id": candidate_id, "owner_user_id": self.owner_user_id, "created_at": now,
+            "book_id": book_id, "platform": platform, "platform_product_id": product_id,
+            "product_url": product_url, "eligibility_status": "unverified",
+            "eligibility_checked_at": None, "eligibility_note": None,
+            "eligibility_revision": 1, "eligibility_checked_by_user_id": None,
+        }
+        conn.execute(
+            "INSERT INTO promotion_candidates(id, owner_user_id, book_id, created_at, eligibility_revision, "
+            "eligibility_checked_by_user_id, payload) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (candidate_id, self.owner_user_id, book_id, now, 1, None, _json(payload)),
+        )
+        return candidate_id
+
+    def _import_create_reference(
+        self, conn: Any, draft: JsonObject, book_id: str | None
+    ) -> str | None:
+        title = draft.get("title")
+        if not title:
+            return None
+        url = draft.get("reference_url")
+        if url:
+            parsed = urlsplit(url)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                return None
+        reference_id = str(uuid4())
+        now = _utc_now()
+        payload = {
+            "id": reference_id, "owner_user_id": self.owner_user_id, "created_at": now,
+            "platform": None, "book_id": book_id, "ref_type": draft.get("ref_type") or "content_item",
+            "external_ref": draft.get("external_ref"), "reference_url": url,
+            "title": title, "note": draft.get("note"),
+            "license_scope": draft.get("license_scope") or "manual_observation",
+            "usage_basis": draft.get("usage_basis") or "人工观察记录，仅作研究参考",
+            "captured_fields": ["title", "observed_note"], "evidence_ids": [],
+            "observed_at": None,
+            "material_statement": "no_third_party_media_or_verbatim_transcript",
+        }
+        conn.execute(
+            "INSERT INTO content_references(id, owner_user_id, created_at, payload) VALUES (?, ?, ?, ?)",
+            (reference_id, self.owner_user_id, now, _json(payload)),
+        )
+        return reference_id
+
+    def _import_create_metric(
+        self, conn: Any, draft: JsonObject, book_id: str | None, file_sha256: str
+    ) -> str | None:
+        observed_at = draft.get("observed_at") or _utc_now()
+        value = draft.get("value")
+        missing_reason = draft.get("missing_reason")
+        basis = draft.get("basis") or "legacy_unclassified"
+        if basis in self._WINDOWED_BASES and not (draft.get("window_start") and draft.get("window_end")):
+            # A windowed basis without a bounded window cannot be trusted as classified;
+            # fall back to the unclassified bucket until a human re-validates it.
+            basis = "legacy_unclassified"
+        evidence_id: str | None = None
+        if value is not None:
+            evidence_id = self._import_backing_evidence(conn, observed_at, file_sha256)
+        metric_id = str(uuid4())
+        collected_at = _utc_now()
+        payload = {
+            "id": metric_id, "owner_user_id": self.owner_user_id, "collected_at": collected_at,
+            "platform": draft.get("platform"), "book_id": book_id,
+            "object_type": draft.get("object_type") or "book_edition",
+            "object_ref": draft.get("object_ref") or f"import:{file_sha256[:12]}:{metric_id[:8]}",
+            "object_label": draft.get("object_label"),
+            "metric_name": draft.get("metric_name") or "other",
+            "metric_definition": draft.get("metric_definition") or "CSV 导入指标，口径待人工核实",
+            "basis": basis,
+            "unit": draft.get("unit") or "unspecified",
+            "value": value, "value_text": draft.get("value_text"),
+            "window_start": draft.get("window_start"), "window_end": draft.get("window_end"),
+            "observed_at": observed_at, "evidence_id": evidence_id,
+            "missing_reason": missing_reason, "confidence": None, "expires_at": None,
+            "note": draft.get("note"), "legacy_backfill": False,
+        }
+        conn.execute(
+            "INSERT INTO metric_observations(id, owner_user_id, collected_at, payload) VALUES (?, ?, ?, ?)",
+            (metric_id, self.owner_user_id, collected_at, _json(payload)),
+        )
+        return metric_id
+
+    def _import_backing_evidence(self, conn: Any, observed_at: str, file_sha256: str) -> str:
+        evidence_id = str(uuid4())
+        collected_at = _utc_now()
+        payload = {
+            "id": evidence_id, "owner_user_id": self.owner_user_id, "collected_at": collected_at,
+            "source_type": "manual",
+            "source_note": f"CSV 导入自动生成的来源记录（文件 {file_sha256[:12]}）",
+            "source_url": None, "observed_at": observed_at,
+            "usage_basis": "人工 CSV 导入记录，仅作研究参考；口径待人工核实",
+            "metric_name": None, "metric_value": None,
+            "metric_window_start": None, "metric_window_end": None,
+            "missing_reason": "CSV 导入来源记录；指标见关联的 MetricObservation",
+        }
+        conn.execute(
+            "INSERT INTO evidence(id, owner_user_id, collected_at, payload) VALUES (?, ?, ?, ?)",
+            (evidence_id, self.owner_user_id, collected_at, _json(payload)),
+        )
+        return evidence_id
 
     def create_creative_project(self, data: Any) -> JsonObject:
         project_data = _dump(data)
@@ -1797,6 +2679,7 @@ class DomainService:
                 (project_key, self.owner_user_id),
             ).fetchall()
             scripts = [_payload(row) for row in script_rows]
+        style_guidance_hints = self.list_approved_style_guidance(book["id"])
         return {
             "owner_user_id": self.owner_user_id,
             "project": project,
@@ -1804,6 +2687,7 @@ class DomainService:
             "promotion_candidate": candidate,
             "evidence": list(evidence_by_id.values()),
             "script_versions": scripts,
+            "style_guidance": style_guidance_hints,
             "asset_rights": [
                 {"origin": "self_created_text", "usage_status": "allowed"},
                 {"origin": "self_created_graphic", "usage_status": "allowed"},
@@ -3059,6 +3943,10 @@ class DomainService:
             "audio_assets",
             "generation_results",
             "model_cost_records",
+            "metric_observations",
+            "content_references",
+            "style_cards",
+            "import_jobs",
         }:
             raise ValueError(f"Unsupported table {table}")
         return conn.execute(

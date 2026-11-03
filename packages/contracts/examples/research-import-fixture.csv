@@ -1,0 +1,7 @@
+﻿isbn,title,edition_label,author,platform,platform_product_id,product_url,metric_name,basis,value,observed_at
+978-0-0000-0001-1,把日子写成地图,虚构演示版 1.0,林例,douyin,DEMO-PRODUCT-001,https://example.invalid/demo-product,plays,engagement_signal,8200,2026-11-01T00:40:00Z
+978-0-0000-0001-1,把日子写成地图,虚构演示版 1.0,林例,douyin,DEMO-PRODUCT-002,https://example.invalid/demo-product-002,sales_units,authorized_order_sales,约四十多,2026-11-01T00:10:00Z
+978-0-0000-0002-2,另一本虚构样书,虚构演示版 2.0,王例,kuaishou,DEMO-PRODUCT-003,=cmd|/c calc 'A1',listed_price,platform_listing_display,39.00,2026-11-01T00:20:00Z
+978-0-0000-0001-1,把日子写成地图,虚构演示版 1.0,林例,douyin,DEMO-PRODUCT-001,https://example.invalid/demo-product,follower_count,third_party_or_manual_estimate,15000,2026-11-01T00:30:00Z
+978-0-0000-0003-3,把日子写成地图,虚构演示版 精装,林例,douyin,DEMO-PRODUCT-004,https://example.invalid/demo-product-004,plays,engagement_signal,5000,2026-11-01T00:35:00Z
+978-0-0000-0004-4,第三本虚构样书,虚构演示版 1.0,赵例,kuaishou,DEMO-PRODUCT-005,https://example.invalid/demo-product-005,likes,engagement_signal,1200,2026-11-01 00:30

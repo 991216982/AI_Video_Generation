@@ -32,10 +32,11 @@ import type {
   ScriptVersionCreate,
 } from "./api";
 import "./styles.css";
+import { ResearchDesk } from "./research";
 
 type Mode = "demo" | "api";
 type Step = "source" | "brief" | "script" | "review" | "package";
-type LibraryTab = "projects" | "books";
+type LibraryTab = "projects" | "books" | "research";
 
 interface BookDraft {
   title: string;
@@ -387,7 +388,7 @@ function App() {
   useEffect(() => savePreference("book-video.apiBaseUrl", apiBaseUrl), [apiBaseUrl]);
 
   useEffect(() => {
-    if (mode !== "api" || !navigatorOpen) return;
+    if (mode !== "api" || !navigatorOpen || navigatorTab === "research") return;
     let active = true;
     setLibraryLoading(true);
     const timer = window.setTimeout(() => {
@@ -1438,8 +1439,9 @@ function App() {
                 <div className="library-tabs" role="tablist" aria-label="历史记录类型">
                   <button aria-selected={navigatorTab === "projects"} className={navigatorTab === "projects" ? "active" : ""} onClick={() => setNavigatorTab("projects")} role="tab" type="button">创作项目</button>
                   <button aria-selected={navigatorTab === "books"} className={navigatorTab === "books" ? "active" : ""} onClick={() => setNavigatorTab("books")} role="tab" type="button">图书版本</button>
+                  <button aria-selected={navigatorTab === "research"} className={navigatorTab === "research" ? "active" : ""} onClick={() => setNavigatorTab("research")} role="tab" type="button">研究台</button>
                 </div>
-                <label className="library-search"><span>{navigatorTab === "books" ? "搜索书名、作者或 ISBN" : "搜索图书、受众、原创角度或项目 ID"}</span><input onChange={(event) => { setNavigatorSearch(event.target.value); setBookCursor(null); setBookCursorHistory([]); setProjectCursor(null); setProjectCursorHistory([]); }} placeholder="输入关键词" value={navigatorSearch} /></label>
+                {navigatorTab !== "research" && <label className="library-search"><span>{navigatorTab === "books" ? "搜索书名、作者或 ISBN" : "搜索图书、受众、原创角度或项目 ID"}</span><input onChange={(event) => { setNavigatorSearch(event.target.value); setBookCursor(null); setBookCursorHistory([]); setProjectCursor(null); setProjectCursorHistory([]); }} placeholder="输入关键词" value={navigatorSearch} /></label>}
               </div>
               {apiReachable === false && (
                 <div className="library-offline" role="status"><span>!</span><div><strong>API 暂不可用</strong><p>请检查 API 基址、服务状态与浏览器跨域设置，然后刷新列表。当前工作区没有从本地缓存恢复。</p></div><button className="button button-secondary" onClick={() => setLibraryReloadKey((value) => value + 1)} type="button">重试连接</button></div>
@@ -1456,6 +1458,8 @@ function App() {
                     })}</div>}
                   <div className="library-pagination"><button className="button button-muted" disabled={!projectCursorHistory.length || libraryLoading} onClick={() => { const prior = [...projectCursorHistory]; const cursor = prior.pop() ?? null; setProjectCursorHistory(prior); setProjectCursor(cursor); }} type="button">← 上一页</button><span>第 {projectCursorHistory.length + 1} 页 · 最多 20 条</span><button className="button button-muted" disabled={!projectNextCursor || libraryLoading} onClick={() => { setProjectCursorHistory((history) => [...history, projectCursor]); setProjectCursor(projectNextCursor); }} type="button">下一页 →</button></div>
                 </>
+              ) : navigatorTab === "research" ? (
+                <ResearchDesk api={api} />
               ) : (
                 <>
                   {libraryBooks.length === 0 && !libraryLoading

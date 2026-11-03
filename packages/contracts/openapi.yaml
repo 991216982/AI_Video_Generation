@@ -1,8 +1,8 @@
 openapi: 3.1.0
 info:
   title: Book Video Workspace API
-  version: 0.3.0
-  description: G3 frozen contract for W3 implementation. Local single-user implementation may use a development identity; every private record is owner-scoped.
+  version: 0.4.0
+  description: G4 frozen contract for the W4 research desk, metric evidence, content references, evidence-based style cards and CSV import. Local single-user implementation may use a development identity; every private record is owner-scoped. v0.3 paths and request fields remain valid.
 servers:
   - url: http://127.0.0.1:8000/api/v1
 paths:
@@ -135,6 +135,28 @@ paths:
         '409': { $ref: '#/components/responses/Error' }
         '422': { $ref: '#/components/responses/Error' }
   /evidence:
+    get:
+      operationId: listEvidence
+      summary: List the current owner's evidence records
+      parameters:
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Cursor' }
+        - name: source_type
+          in: query
+          required: false
+          schema: { type: string, enum: [manual, licensed] }
+        - name: q
+          in: query
+          required: false
+          description: Trimmed case-insensitive search across source note and URL
+          schema: { type: string, maxLength: 100 }
+      responses:
+        '200':
+          description: Stable descending created_at/id page, owner-scoped
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EvidencePage' }
+        '422': { $ref: '#/components/responses/Error' }
     post:
       operationId: createEvidence
       requestBody:
@@ -148,6 +170,283 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Evidence' }
+        '422': { $ref: '#/components/responses/Error' }
+  /metrics:
+    get:
+      operationId: listMetricObservations
+      summary: List the current owner's metric observations
+      description: Comparable rankings and charts must stay within the same platform, object range, metric, unit, basis and time window; insufficient evidence renders as "not obtained", never a forced rank.
+      parameters:
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Cursor' }
+        - name: platform
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/Platform' }
+        - name: object_type
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/ObjectType' }
+        - name: metric_name
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/MetricName' }
+        - name: basis
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/MetricBasis' }
+        - name: book_id
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/Id' }
+      responses:
+        '200':
+          description: Stable descending observed_at/id page, owner-scoped
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MetricObservationPage' }
+        '422': { $ref: '#/components/responses/Error' }
+    post:
+      operationId: createMetricObservation
+      summary: Record one metric observation with its source evidence and basis
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MetricObservationCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MetricObservation' }
+        '422': { $ref: '#/components/responses/Error' }
+  /metrics/{observation_id}:
+    get:
+      operationId: getMetricObservation
+      parameters:
+        - { $ref: '#/components/parameters/ObservationId' }
+      responses:
+        '200':
+          description: Observation
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MetricObservation' }
+        '404': { $ref: '#/components/responses/Error' }
+  /content-references:
+    get:
+      operationId: listContentReferences
+      summary: List the current owner's research content references
+      parameters:
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Cursor' }
+        - name: platform
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/Platform' }
+        - name: ref_type
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/ObjectType' }
+        - name: book_id
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/Id' }
+      responses:
+        '200':
+          description: Stable descending created_at/id page, owner-scoped
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ContentReferencePage' }
+        '422': { $ref: '#/components/responses/Error' }
+    post:
+      operationId: createContentReference
+      summary: Save a research reference with usage basis; no third-party media or full subtitles are stored as production assets
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ContentReferenceCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ContentReference' }
+        '422': { $ref: '#/components/responses/Error' }
+  /content-references/{reference_id}:
+    get:
+      operationId: getContentReference
+      parameters:
+        - { $ref: '#/components/parameters/ReferenceId' }
+      responses:
+        '200':
+          description: Reference
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ContentReference' }
+        '404': { $ref: '#/components/responses/Error' }
+  /style-cards:
+    get:
+      operationId: listStyleCards
+      summary: List the current owner's style cards
+      parameters:
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Cursor' }
+        - name: review_status
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/StyleCardStatus' }
+        - name: target_platform
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/Platform' }
+        - name: book_id
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/Id' }
+      responses:
+        '200':
+          description: Stable descending created_at/id page, owner-scoped
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StyleCardPage' }
+        '422': { $ref: '#/components/responses/Error' }
+    post:
+      operationId: createStyleCard
+      summary: Create a style card draft or pending card with evidence-linked abstract features
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StyleCardCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StyleCard' }
+        '422': { $ref: '#/components/responses/Error' }
+  /style-cards/{style_card_id}:
+    get:
+      operationId: getStyleCard
+      parameters:
+        - { $ref: '#/components/parameters/StyleCardId' }
+      responses:
+        '200':
+          description: Style card
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StyleCard' }
+        '404': { $ref: '#/components/responses/Error' }
+    patch:
+      operationId: updateStyleCard
+      summary: Human revision of an existing style card; revision conflict returns 409
+      parameters:
+        - { $ref: '#/components/parameters/StyleCardId' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StyleCardUpdate' }
+      responses:
+        '200':
+          description: Updated card with incremented revision
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StyleCard' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+  /style-cards/{style_card_id}/review:
+    post:
+      operationId: reviewStyleCard
+      summary: Human approve or reject a style card; approval requires valid evidence
+      parameters:
+        - { $ref: '#/components/parameters/StyleCardId' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StyleCardReview' }
+      responses:
+        '200':
+          description: Reviewed card
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StyleCard' }
+        '404': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+  /imports:
+    get:
+      operationId: listImports
+      summary: List the current owner's CSV import jobs
+      parameters:
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Cursor' }
+        - name: status
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/ImportStatus' }
+      responses:
+        '200':
+          description: Stable descending created_at/id page, owner-scoped
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImportPage' }
+        '422': { $ref: '#/components/responses/Error' }
+  /imports/preview:
+    post:
+      operationId: previewImport
+      summary: Parse a CSV without writing business data; return diagnostics and mapping suggestions
+      description: UTF-8 with optional BOM; maximum file size and row count enforced server-side. Formula-prefixed cells are flagged, never executed. The preview draft expires and writes nothing on its own.
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema: { $ref: '#/components/schemas/ImportPreviewRequest' }
+      responses:
+        '200':
+          description: Preview diagnostics; no business rows persisted yet
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImportPreview' }
+        '409': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+  /imports/{import_id}:
+    get:
+      operationId: getImport
+      parameters:
+        - { $ref: '#/components/parameters/ImportId' }
+      responses:
+        '200':
+          description: Import job status, counts and row-level failures
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImportJob' }
+        '404': { $ref: '#/components/responses/Error' }
+  /imports/{import_id}/confirm:
+    post:
+      operationId: confirmImport
+      summary: Apply a previously previewed CSV with the approved mapping; partial failures are recorded per row
+      parameters:
+        - { $ref: '#/components/parameters/ImportId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ImportConfirm' }
+      responses:
+        '200':
+          description: Applied, partially applied or fully failed import result
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImportJob' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
         '422': { $ref: '#/components/responses/Error' }
   /creative-projects:
     get:
@@ -492,6 +791,10 @@ components:
     ProjectId: { name: project_id, in: path, required: true, schema: { $ref: '#/components/schemas/Id' } }
     RunId: { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/Id' } }
     RenderId: { name: render_id, in: path, required: true, schema: { $ref: '#/components/schemas/Id' } }
+    ObservationId: { name: observation_id, in: path, required: true, schema: { $ref: '#/components/schemas/Id' } }
+    ReferenceId: { name: reference_id, in: path, required: true, schema: { $ref: '#/components/schemas/Id' } }
+    StyleCardId: { name: style_card_id, in: path, required: true, schema: { $ref: '#/components/schemas/Id' } }
+    ImportId: { name: import_id, in: path, required: true, schema: { $ref: '#/components/schemas/Id' } }
     IdempotencyKey: { name: Idempotency-Key, in: header, required: true, schema: { type: string, minLength: 8, maxLength: 128 } }
     Limit: { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
     Cursor: { name: cursor, in: query, required: false, description: Opaque owner- and filter-bound cursor from the previous page, schema: { type: string, minLength: 1 } }
@@ -899,3 +1202,302 @@ components:
             edition_matches: { type: boolean }
             rights_confirmed: { type: boolean }
             manual_attachment_required: { type: boolean, const: true }
+    EvidencePage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Evidence' } }
+        next_cursor: { type: [string, 'null'] }
+    ObjectType:
+      type: string
+      enum: [product_listing, creator_account, content_item, book_edition]
+    MetricBasis:
+      type: string
+      enum:
+        - authorized_order_sales
+        - platform_listing_display
+        - third_party_or_manual_estimate
+        - engagement_signal
+        - legacy_unclassified
+      description: >
+        authorized_order_sales: actual authorized merchant order data (the only basis that may be called real sales).
+        platform_listing_display: a value shown on a platform page; not an authorized order feed.
+        third_party_or_manual_estimate: estimate from a licensed third-party service or a person; never presented as actual sales.
+        engagement_signal: plays, likes, comments, shares, followers, ranking, search heat; attention signal, never sales.
+        legacy_unclassified: v0.3 legacy record whose basis could not be classified; treated as an estimate until re-validated.
+    MetricName:
+      type: string
+      enum: [sales_units, sales_amount, listed_price, displayed_sales_label, plays, likes, comments, shares, favorites, follower_count, ranking_position, search_heat, other]
+    MetricUnit:
+      type: string
+      enum: [count, minor_currency, currency_yuan, views, likes, percent, rank, score, text, unspecified]
+    MetricObservationCreate:
+      type: object
+      required: [object_type, object_ref, metric_name, metric_definition, basis, unit, value, observed_at]
+      properties:
+        platform: { anyOf: [{ $ref: '#/components/schemas/Platform' }, { type: 'null' }] }
+        book_id: { anyOf: [{ $ref: '#/components/schemas/Id' }, { type: 'null' }] }
+        object_type: { $ref: '#/components/schemas/ObjectType' }
+        object_ref: { type: string, minLength: 1, maxLength: 200, description: Platform-native stable ID or a stable manual label; never a free-text display name }
+        object_label: { type: [string, 'null'], maxLength: 200 }
+        metric_name: { $ref: '#/components/schemas/MetricName' }
+        metric_definition: { type: string, minLength: 1, maxLength: 500, description: Exact definition, scope and calculation口径 behind this value }
+        basis: { $ref: '#/components/schemas/MetricBasis' }
+        unit: { $ref: '#/components/schemas/MetricUnit' }
+        value: { type: [number, 'null'], description: Numeric value; null means the datum is missing (with missing_reason). Never use 0 to mean unknown; a real measured zero is 0 with an evidence link. }
+        value_text: { type: [string, 'null'], maxLength: 100, description: Non-numeric platform label such as "10万+"; only for display labels, never a ranked number }
+        window_start: { anyOf: [{ $ref: '#/components/schemas/Timestamp' }, { type: 'null' }] }
+        window_end: { anyOf: [{ $ref: '#/components/schemas/Timestamp' }, { type: 'null' }] }
+        observed_at: { $ref: '#/components/schemas/Timestamp' }
+        evidence_id: { anyOf: [{ $ref: '#/components/schemas/Id' }, { type: 'null' }] }
+        missing_reason: { type: [string, 'null'], maxLength: 500 }
+        confidence: { anyOf: [{ type: 'string', enum: [high, medium, low] }, { type: 'null' }] }
+        expires_at: { anyOf: [{ $ref: '#/components/schemas/Timestamp' }, { type: 'null' }] }
+        note: { type: [string, 'null'], maxLength: 1000 }
+      allOf:
+        - if:
+            properties: { value: { type: 'null' } }
+            required: [value]
+          then:
+            properties:
+              missing_reason: { type: 'string', minLength: 1 }
+              evidence_id: { anyOf: [{ $ref: '#/components/schemas/Id' }, { type: 'null' }] }
+        - if:
+            properties: { value: { not: { type: 'null' } } }
+            required: [value]
+          then:
+            required: [evidence_id]
+            properties:
+              evidence_id: { $ref: '#/components/schemas/Id' }
+              missing_reason: { type: 'null' }
+        - if:
+            properties: { window_start: { type: 'string' } }
+            required: [window_start]
+          then:
+            required: [window_end]
+            properties: { window_end: { type: 'string' } }
+        - if:
+            properties: { basis: { enum: [authorized_order_sales, third_party_or_manual_estimate, engagement_signal] } }
+            required: [basis]
+          then:
+            required: [window_start, window_end]
+    MetricObservation:
+      allOf:
+        - { $ref: '#/components/schemas/MetricObservationCreate' }
+        - type: object
+          required: [id, owner_user_id, collected_at, legacy_backfill]
+          properties:
+            id: { $ref: '#/components/schemas/Id' }
+            owner_user_id: { $ref: '#/components/schemas/Id' }
+            collected_at: { $ref: '#/components/schemas/Timestamp' }
+            legacy_backfill: { type: boolean, default: false, description: True when migrated from a v0.3 evidence record; basis must be re-validated before ranking }
+    MetricObservationPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/MetricObservation' } }
+        next_cursor: { type: [string, 'null'] }
+    ContentReferenceCreate:
+      type: object
+      required: [ref_type, title, license_scope, usage_basis, material_statement]
+      properties:
+        platform: { anyOf: [{ $ref: '#/components/schemas/Platform' }, { type: 'null' }] }
+        book_id: { anyOf: [{ $ref: '#/components/schemas/Id' }, { type: 'null' }] }
+        ref_type: { $ref: '#/components/schemas/ObjectType' }
+        external_ref: { type: [string, 'null'], maxLength: 200 }
+        reference_url: { type: [string, 'null'], format: uri, description: Source link for research traceability; a link is not a reuse license }
+        title: { type: string, minLength: 1, maxLength: 200 }
+        note: { type: [string, 'null'], maxLength: 1000, description: Abstract observational note; no third-party full transcript or verbatim copy }
+        license_scope: { type: string, enum: [own_account, licensed_data_service, manual_observation] }
+        usage_basis: { type: string, minLength: 1, maxLength: 500, description: Why this reference may be consulted and the permitted reuse scope }
+        captured_fields:
+          type: array
+          items: { type: string, enum: [title, author, platform_ref, url, observed_note, publication_date, platform_label] }
+          default: []
+        evidence_ids: { type: array, items: { $ref: '#/components/schemas/Id' }, default: [] }
+        observed_at: { anyOf: [{ $ref: '#/components/schemas/Timestamp' }, { type: 'null' }] }
+        material_statement: { type: string, const: no_third_party_media_or_verbatim_transcript, description: Explicit declaration that no video, audio, cover image, product image or full subtitle/transcript is stored for reuse in production }
+    ContentReference:
+      allOf:
+        - { $ref: '#/components/schemas/ContentReferenceCreate' }
+        - type: object
+          required: [id, owner_user_id, created_at]
+          properties:
+            id: { $ref: '#/components/schemas/Id' }
+            owner_user_id: { $ref: '#/components/schemas/Id' }
+            created_at: { $ref: '#/components/schemas/Timestamp' }
+    ContentReferencePage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/ContentReference' } }
+        next_cursor: { type: [string, 'null'] }
+    StyleCardStatus:
+      type: string
+      enum: [draft, pending_review, approved, rejected]
+    StyleFeature:
+      type: object
+      additionalProperties: false
+      required: [feature_key, label, explanation, evidence_ids, sample_count]
+      properties:
+        feature_key: { type: string, enum: [opening_hook, narrative_structure, pacing, visual_style, subtitle_style, tone, cta, audience_match, other] }
+        label: { type: string, minLength: 1, maxLength: 100, description: Abstract short tag, e.g. "反常识开场提问" }
+        explanation: { type: string, minLength: 1, maxLength: 500, description: Abstract description; no verbatim third-party subtitle or copied script }
+        evidence_ids: { type: array, items: { $ref: '#/components/schemas/Id' }, minItems: 1 }
+        sample_count: { type: integer, minimum: 1 }
+    StyleCardCreate:
+      type: object
+      required: [title, derived_by]
+      properties:
+        title: { type: string, minLength: 1, maxLength: 200 }
+        target_platform: { anyOf: [{ $ref: '#/components/schemas/Platform' }, { type: 'null' }] }
+        book_id: { anyOf: [{ $ref: '#/components/schemas/Id' }, { type: 'null' }] }
+        derived_by: { type: string, enum: [manual, workflow_extraction], default: manual }
+        features: { type: array, items: { $ref: '#/components/schemas/StyleFeature' }, default: [] }
+        evidence_ids: { type: array, items: { $ref: '#/components/schemas/Id' }, default: [] }
+        reference_ids: { type: array, items: { $ref: '#/components/schemas/Id' }, default: [] }
+        human_note: { type: [string, 'null'], maxLength: 1000 }
+    StyleCardUpdate:
+      type: object
+      additionalProperties: false
+      required: [expected_revision]
+      properties:
+        expected_revision: { type: integer, minimum: 1 }
+        title: { type: string, minLength: 1, maxLength: 200 }
+        target_platform: { anyOf: [{ $ref: '#/components/schemas/Platform' }, { type: 'null' }] }
+        features: { type: array, items: { $ref: '#/components/schemas/StyleFeature' } }
+        evidence_ids: { type: array, items: { $ref: '#/components/schemas/Id' } }
+        reference_ids: { type: array, items: { $ref: '#/components/schemas/Id' } }
+        human_note: { type: [string, 'null'], maxLength: 1000 }
+    StyleCardReview:
+      type: object
+      additionalProperties: false
+      required: [decision]
+      properties:
+        decision: { type: string, enum: [approve, reject] }
+        note: { type: [string, 'null'], maxLength: 1000 }
+      allOf:
+        - if: { properties: { decision: { const: reject } }, required: [decision] }
+          then: { properties: { note: { type: 'string', minLength: 1, maxLength: 1000 } } }
+    StyleCard:
+      allOf:
+        - { $ref: '#/components/schemas/StyleCardCreate' }
+        - type: object
+          required: [id, owner_user_id, created_at, updated_at, revision, review_status, edited_by_user_id, last_edited_at, abstract_only, evidence_sample_count]
+          properties:
+            id: { $ref: '#/components/schemas/Id' }
+            owner_user_id: { $ref: '#/components/schemas/Id' }
+            created_at: { $ref: '#/components/schemas/Timestamp' }
+            updated_at: { $ref: '#/components/schemas/Timestamp' }
+            revision: { type: integer, minimum: 1 }
+            review_status: { $ref: '#/components/schemas/StyleCardStatus' }
+            edited_by_user_id: { anyOf: [{ $ref: '#/components/schemas/Id' }, { type: 'null' }] }
+            last_edited_at: { anyOf: [{ $ref: '#/components/schemas/Timestamp' }, { type: 'null' }] }
+            abstract_only: { type: boolean, const: true }
+            evidence_sample_count: { type: integer, minimum: 0, description: Number of distinct evidence records backing this card }
+    StyleCardPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/StyleCard' } }
+        next_cursor: { type: [string, 'null'] }
+    ImportStatus:
+      type: string
+      enum: [preview, applied, partially_applied, failed]
+    ImportRowDiagnostic:
+      type: object
+      additionalProperties: false
+      required: [row_number, code, message, severity]
+      properties:
+        row_number: { type: integer, minimum: 1 }
+        field: { type: [string, 'null'], maxLength: 100 }
+        code:
+          type: string
+          enum:
+            - encoding_error
+            - malformed_row
+            - missing_required_field
+            - invalid_book_isbn
+            - invalid_number
+            - invalid_timestamp
+            - invalid_platform
+            - invalid_url
+            - formula_injection
+            - duplicate_natural_key
+            - edition_mismatch_suspected
+            - unknown_column
+            - field_too_long
+            - invalid_mapping
+            - reference_rights_unsupported
+        message: { type: string, maxLength: 500 }
+        severity: { type: string, enum: [error, warning] }
+    ImportPreviewRequest:
+      type: object
+      required: [file]
+      properties:
+        file: { type: string, format: binary, description: CSV text file; UTF-8 with optional BOM. Size and row limits enforced server-side; bytes are never executed. }
+        filename_hint: { type: string, maxLength: 200 }
+    ImportPreview:
+      type: object
+      required: [id, owner_user_id, status, filename, encoding_detected, file_sha256, size_bytes, columns, total_rows, parsed_rows, valid_rows, failed_rows, skipped_duplicate_rows, mapping_suggestions, row_diagnostics, created_at, expires_at]
+      properties:
+        id: { $ref: '#/components/schemas/Id' }
+        owner_user_id: { $ref: '#/components/schemas/Id' }
+        status: { $ref: '#/components/schemas/ImportStatus' }
+        filename: { type: string, maxLength: 200 }
+        encoding_detected: { type: string, enum: [utf8, utf8_bom, unknown] }
+        file_sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
+        size_bytes: { type: integer, minimum: 0 }
+        columns: { type: array, items: { type: string } }
+        total_rows: { type: integer, minimum: 0 }
+        parsed_rows: { type: integer, minimum: 0 }
+        valid_rows: { type: integer, minimum: 0 }
+        failed_rows: { type: integer, minimum: 0 }
+        skipped_duplicate_rows: { type: integer, minimum: 0 }
+        mapping_suggestions: { type: object, additionalProperties: { type: [string, 'null'] }, description: Suggested target field per source column; the confirm request supplies the final mapping }
+        row_diagnostics: { type: array, items: { $ref: '#/components/schemas/ImportRowDiagnostic' } }
+        created_at: { $ref: '#/components/schemas/Timestamp' }
+        expires_at: { $ref: '#/components/schemas/Timestamp', description: Preview draft TTL; expired previews cannot be confirmed }
+    ImportConfirm:
+      type: object
+      additionalProperties: false
+      required: [mapping]
+      properties:
+        mapping: { type: object, additionalProperties: { type: ['string', 'null'] }, description: Source column to target field mapping; unmapped columns are ignored }
+        on_duplicate: { type: string, enum: [skip, update], default: skip }
+        match_by: { type: string, enum: [isbn, isbn_and_edition, title_author_fuzzy], default: isbn_and_edition }
+        normalize_isbn: { type: boolean, default: true }
+        note: { type: [string, 'null'], maxLength: 500 }
+    ImportCounts:
+      type: object
+      required: [total, parsed, persisted, skipped_duplicate, failed, warnings]
+      properties:
+        total: { type: integer, minimum: 0 }
+        parsed: { type: integer, minimum: 0 }
+        persisted: { type: integer, minimum: 0 }
+        skipped_duplicate: { type: integer, minimum: 0 }
+        failed: { type: integer, minimum: 0 }
+        warnings: { type: integer, minimum: 0 }
+    ImportJob:
+      type: object
+      required: [id, owner_user_id, status, filename, file_sha256, created_at, updated_at, counts, row_diagnostics, entity_kinds, mapping]
+      properties:
+        id: { $ref: '#/components/schemas/Id' }
+        owner_user_id: { $ref: '#/components/schemas/Id' }
+        status: { $ref: '#/components/schemas/ImportStatus' }
+        filename: { type: string, maxLength: 200 }
+        file_sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
+        created_at: { $ref: '#/components/schemas/Timestamp' }
+        updated_at: { $ref: '#/components/schemas/Timestamp' }
+        counts: { $ref: '#/components/schemas/ImportCounts' }
+        row_diagnostics: { type: array, items: { $ref: '#/components/schemas/ImportRowDiagnostic' } }
+        entity_kinds: { type: array, items: { type: string, enum: [book_edition, promotion_candidate, metric_observation, evidence, content_reference] } }
+        mapping: { type: object, additionalProperties: { type: ['string', 'null'] } }
+        on_duplicate: { type: string, enum: [skip, update] }
+        match_by: { type: string, enum: [isbn, isbn_and_edition, title_author_fuzzy] }
+    ImportPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/ImportJob' } }
+        next_cursor: { type: [string, 'null'] }
