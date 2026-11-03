@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Callable
+from typing import Callable, Literal
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, BackgroundTasks, File, Form, Header, Query, Request, UploadFile
@@ -220,7 +220,7 @@ def create_api_router(
     def list_evidence(
         limit: int = Query(default=20, ge=1, le=100),
         cursor: str | None = Query(default=None, min_length=1),
-        source_type: str | None = Query(default=None, enum=["manual", "licensed"]),
+        source_type: Literal["manual", "licensed"] | None = Query(default=None),
         q: str | None = Query(default=None, max_length=100),
     ) -> dict:
         return domain.list_evidence(limit=limit, cursor=cursor, source_type=source_type, q=q)
@@ -229,8 +229,8 @@ def create_api_router(
     def list_metrics(
         limit: int = Query(default=20, ge=1, le=100),
         cursor: str | None = Query(default=None, min_length=1),
-        platform: str | None = Query(default=None, enum=["douyin", "kuaishou"]),
-        object_type: str | None = Query(default=None, enum=["product_listing", "creator_account", "content_item", "book_edition"]),
+        platform: Literal["douyin", "kuaishou"] | None = Query(default=None),
+        object_type: Literal["product_listing", "creator_account", "content_item", "book_edition"] | None = Query(default=None),
         metric_name: str | None = Query(default=None),
         basis: str | None = Query(default=None),
         book_id: UUID | None = Query(default=None),
@@ -257,8 +257,8 @@ def create_api_router(
     def list_content_references(
         limit: int = Query(default=20, ge=1, le=100),
         cursor: str | None = Query(default=None, min_length=1),
-        platform: str | None = Query(default=None, enum=["douyin", "kuaishou"]),
-        ref_type: str | None = Query(default=None, enum=["product_listing", "creator_account", "content_item", "book_edition"]),
+        platform: Literal["douyin", "kuaishou"] | None = Query(default=None),
+        ref_type: Literal["product_listing", "creator_account", "content_item", "book_edition"] | None = Query(default=None),
         book_id: UUID | None = Query(default=None),
     ) -> dict:
         return domain.list_content_references(
@@ -281,8 +281,8 @@ def create_api_router(
     def list_style_cards(
         limit: int = Query(default=20, ge=1, le=100),
         cursor: str | None = Query(default=None, min_length=1),
-        review_status: str | None = Query(default=None, enum=["draft", "pending_review", "approved", "rejected"]),
-        target_platform: str | None = Query(default=None, enum=["douyin", "kuaishou"]),
+        review_status: Literal["draft", "pending_review", "approved", "rejected"] | None = Query(default=None),
+        target_platform: Literal["douyin", "kuaishou"] | None = Query(default=None),
         book_id: UUID | None = Query(default=None),
     ) -> dict:
         return domain.list_style_cards(
@@ -314,7 +314,7 @@ def create_api_router(
     def list_imports(
         limit: int = Query(default=20, ge=1, le=100),
         cursor: str | None = Query(default=None, min_length=1),
-        status: str | None = Query(default=None, enum=["preview", "applied", "partially_applied", "failed"]),
+        status: Literal["preview", "applied", "partially_applied", "failed"] | None = Query(default=None),
     ) -> dict:
         return domain.list_imports(limit=limit, cursor=cursor, status=status)
 

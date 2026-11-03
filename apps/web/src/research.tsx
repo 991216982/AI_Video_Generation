@@ -72,6 +72,12 @@ const BASIS_META: Record<MetricBasis, { label: string; className: string; hint: 
   legacy_unclassified: { label: "待分类（回填）", className: "basis-legacy", hint: "旧数据回填，重新核实前不参与排名" },
 };
 
+const WINDOWED_BASES: ReadonlySet<MetricBasis> = new Set([
+  "authorized_order_sales",
+  "third_party_or_manual_estimate",
+  "engagement_signal",
+]);
+
 const OBJECT_TYPE_LABELS: Record<ObjectType, string> = {
   product_listing: "商品",
   creator_account: "账号",
@@ -123,7 +129,10 @@ const LICENSE_LABELS: Record<string, string> = {
 function researchError(error: unknown): string {
   if (error instanceof ApiRequestError) {
     const suffix = error.requestId ? `（请求编号 ${error.requestId}）` : "";
-    return `${error.message}${suffix}`;
+    const message = error.code === "validation_error" && error.message === "Request validation failed"
+      ? "输入未通过校验，请检查必填字段、来源及统计时间窗。"
+      : error.message;
+    return `${message}${suffix}`;
   }
   if (error instanceof Error) return error.message;
   return "操作未完成，请检查输入后重试。";
@@ -361,6 +370,18 @@ export function ResearchDesk({ api }: { api: BookVideoApi }) {
       setError("请填写有效的统计时间窗。");
       return;
     }
+    if (Boolean(start) !== Boolean(end)) {
+      setError("统计时间窗需要同时填写开始和结束时间。");
+      return;
+    }
+    if (WINDOWED_BASES.has(metricDraft.basis) && (!start || !end)) {
+      setError(`“${BASIS_META[metricDraft.basis].label}”需要填写统计时间窗的开始和结束时间。`);
+      return;
+    }
+    if (start && end && start > end) {
+      setError("统计时间窗的开始时间不能晚于结束时间。");
+      return;
+    }
     try {
       setError("");
       await api.createMetric({
@@ -574,7 +595,7 @@ export function ResearchDesk({ api }: { api: BookVideoApi }) {
               <label>时间窗结束<input type="datetime-local" value={metricDraft.windowEnd} onChange={(event) => setMetricDraft({ ...metricDraft, windowEnd: event.target.value })} /></label>
               <label>观察时间<input type="datetime-local" value={metricDraft.observedAt} onChange={(event) => setMetricDraft({ ...metricDraft, observedAt: event.target.value })} /></label>
               <label>来源证据 ID<input value={metricDraft.evidenceId} onChange={(event) => setMetricDraft({ ...metricDraft, evidenceId: event.target.value })} placeholder="有数值时必填" /></label>
-              <p>只有获授权商家订单可选“实际销量”；估算、展示文案和热度必须保持各自口径。保存前由服务端校验来源与时间窗。</p>
+              <p>只有获授权商家订单可选“实际销量”；估算、展示文案和热度必须保持各自口径。实际销量、估算和热度信号需同时填写时间窗开始与结束；其他来源和口径由服务端校验。</p>
               <button className="button button-primary" type="submit">保存人工指标</button>
             </form>
           </details>
